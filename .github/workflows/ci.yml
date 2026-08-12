@@ -1,34 +1,73 @@
 name: ci
+
 on:
   push:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  quality-and-postgres:
+  linux-quality:
+    name: Linux Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --python "${{ matrix.python-version }}" --locked --dev
+      - run: uv run --python "${{ matrix.python-version }}" --locked --dev ruff check .
+      - run: uv run --python "${{ matrix.python-version }}" --locked --dev ruff format --check .
+      - run: uv run --python "${{ matrix.python-version }}" --locked --dev mypy kairos_persistence
+      - run: uv run --python "${{ matrix.python-version }}" --locked --dev bandit -q -r kairos_persistence -x tests
+      - run: uv run --python "${{ matrix.python-version }}" --locked --dev pytest -q -m "not integration"
+      - run: uv build --no-sources
+
+  windows-unit:
+    name: Windows unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --python 3.11 --locked --dev
+      - run: uv run --python 3.11 --locked --dev pytest -q -m "not integration"
+
+  timescale-integration:
+    name: TimescaleDB integration
     runs-on: ubuntu-latest
     services:
       timescaledb:
-        image: timescale/timescaledb:latest-pg16
+        image: timescale/timescaledb:2.28.3-pg16
         env:
           POSTGRES_USER: kairos
           POSTGRES_PASSWORD: kairos_test
           POSTGRES_DB: kairos
-        ports: ["5432:5432"]
+        ports:
+          - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U kairos"
-          --health-interval 5s --health-timeout 5s --health-retries 10
+          --health-cmd "pg_isready -U kairos -d kairos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       KAIROS_PERSISTENCE_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
+          enable-cache: true
           python-version: "3.11"
-      - run: pip install -e ".[dev]" "kairos-core @ git+https://github.com/Kairos-cryptoAI/kairos-core.git"
-      - run: ruff check .
-      - run: mypy kairos_persistence
-      - run: bandit -q -r kairos_persistence -x tests
-      - run: pytest -q
+      - run: uv sync --python 3.11 --locked --dev
       - name: Migration smoke
-        run: python -c "import asyncio; from kairos_persistence import Database; d=Database(); asyncio.run(d.connect()); asyncio.run(d.migrate()); asyncio.run(d.close())"
+        run: uv run --python 3.11 --locked --dev python scripts/migration_smoke.py
+      - run: uv run --python 3.11 --locked --dev pytest -q -m integration

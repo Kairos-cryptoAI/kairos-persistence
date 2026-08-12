@@ -1,4 +1,5 @@
 """Small explicit asyncpg lifecycle wrapper; no hidden ORM behavior."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
@@ -60,6 +61,4 @@ class Database:
                 if applied:
                     continue
                 await connection.execute(path.read_text(encoding="utf-8"))
-                await connection.execute(
-                    "INSERT INTO schema_migrations(version) VALUES ($1)", path.name
-                )
+                await connection.execute("INSERT INTO schema_migrations(version) VALUES ($1)", path.name)
