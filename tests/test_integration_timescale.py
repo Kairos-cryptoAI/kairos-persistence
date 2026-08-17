@@ -233,8 +233,9 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
                 request_payload=request,
             ),
         )
-        assert first == duplicate
-        assert first.status is EffectStatus.PREPARED
+        assert {first.created, duplicate.created} == {True, False}
+        assert first.effect == duplicate.effect
+        assert first.effect.status is EffectStatus.PREPARED
         assert [item.effect_key for item in await journal.recovery_required(exchange="evedex")] == [
             effect_key
         ]

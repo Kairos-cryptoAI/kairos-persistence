@@ -45,6 +45,12 @@ class ExecutionEffect:
     journal_head_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class EffectPreparation:
+    effect: ExecutionEffect
+    created: bool
+
+
 class ExecutionJournalRepository:
     """Serialize effect transitions and preserve a per-effect SHA-256 chain."""
 
@@ -60,7 +66,7 @@ class ExecutionJournalRepository:
         symbol: str,
         client_order_id: str | None,
         request_payload: dict[str, Any],
-    ) -> ExecutionEffect:
+    ) -> EffectPreparation:
         self._validate_identity(effect_key, exchange, symbol, client_order_id)
         _request_json, request_sha256 = canonical_payload(request_payload)
         event_payload = {
@@ -94,7 +100,7 @@ class ExecutionJournalRepository:
                         raise MessageIdentityConflict(
                             f"execution effect {effect_key!r} was reused with different immutable content"
                         )
-                    return effect
+                    return EffectPreparation(effect=effect, created=False)
                 event_sha256 = self._event_sha(effect_key, EffectStatus.PREPARED, event_payload, None)
                 row = await connection.fetchrow(
                     """INSERT INTO execution_effects
@@ -121,7 +127,7 @@ class ExecutionJournalRepository:
                 )
         if row is None:  # defensive: INSERT ... RETURNING must return one row
             raise RuntimeError("execution journal prepare returned no row")
-        return self._record(row)
+        return EffectPreparation(effect=self._record(row), created=True)
 
     async def confirm(
         self,

@@ -3,6 +3,7 @@
 from .config import PersistenceSettings
 from .database import Database
 from .execution_journal import (
+    EffectPreparation,
     EffectStatus,
     EffectType,
     ExecutionEffect,
@@ -22,6 +23,7 @@ __all__ = [
     "Database",
     "DurableMessageBus",
     "EffectStatus",
+    "EffectPreparation",
     "EffectType",
     "ExecutionEffect",
     "ExecutionJournalRepository",
