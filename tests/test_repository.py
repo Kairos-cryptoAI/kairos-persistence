@@ -65,18 +65,30 @@ class _FakeConnection:
         return _FakeTransaction(self)
 
     async def fetchrow(self, sql: str, *params: Any) -> dict[str, Any] | None:
+        compact = " ".join(sql.split())
+        if compact.startswith("SELECT status, topic, payload_sha256 FROM message_inbox"):
+            row = self.inbox.get((params[0], params[1]))
+            return None if row is None else row.copy()
+        if compact.startswith("SELECT topic, payload, payload_sha256 FROM message_outbox"):
+            row = self.outbox.get(params[0])
+            return None if row is None else row.copy()
         kind = _sql_kind(sql)
         self.calls.append(("fetchrow", kind, params))
         assert kind == "claim"
-        consumer, message_id, topic, _lease = params
+        consumer, message_id, topic, _lease, payload_sha256 = params
         key = (consumer, message_id)
         row = self.inbox.get(key)
         if row is None:
-            self.inbox[key] = {"topic": topic, "status": "PROCESSING", "attempts": 1}
-            return {"attempts": 1}
+            self.inbox[key] = {
+                "topic": topic,
+                "status": "PROCESSING",
+                "attempts": 1,
+                "payload_sha256": payload_sha256,
+            }
+            return self.inbox[key].copy()
         if row["status"] == "FAILED":
             row.update(status="PROCESSING", attempts=row["attempts"] + 1)
-            return {"attempts": row["attempts"]}
+            return row.copy()
         return None
 
     async def fetchval(self, sql: str, *params: Any) -> str | None:
@@ -91,10 +103,14 @@ class _FakeConnection:
             self.business.append((sql, params))
             return "INSERT 0 1"
         if kind == "outbox":
-            message_id, topic, payload = params
+            message_id, topic, payload, payload_sha256 = params
             if message_id in self.outbox:
                 return "INSERT 0 0"
-            self.outbox[message_id] = {"topic": topic, "payload": payload}
+            self.outbox[message_id] = {
+                "topic": topic,
+                "payload": payload,
+                "payload_sha256": payload_sha256,
+            }
             return "INSERT 0 1"
 
         consumer, message_id = params[:2]
@@ -168,7 +184,7 @@ async def test_message_transaction_commits_business_outbox_and_completion_togeth
     async with repo.message_transaction("execution", "incoming-1", "orders") as tx:
         assert tx.claim.claimed is True
         await tx.connection.execute("INSERT INTO event_audit VALUES (...) ", "business-row")
-        assert await tx.enqueue_outbox("outgoing-1", "reports", '{"ok": true}') is True
+        assert await tx.enqueue_outbox("outgoing-1", "reports", '{"ok":true}', "0" * 64) is True
         await tx.complete({"order": "exchange-1"})
 
     assert connection.inbox[("execution", "incoming-1")]["status"] == "COMPLETED"
@@ -190,7 +206,7 @@ async def test_message_transaction_rolls_back_business_and_outbox_then_records_f
     with pytest.raises(RuntimeError, match="exchange unavailable"):
         async with repo.message_transaction("execution", "incoming-1", "orders") as tx:
             await tx.connection.execute("INSERT INTO event_audit VALUES (...) ", "business-row")
-            await tx.enqueue_outbox("outgoing-1", "reports", "{}")
+            await tx.enqueue_outbox("outgoing-1", "reports", "{}", "0" * 64)
             raise RuntimeError("exchange unavailable")
 
     row = connection.inbox[("execution", "incoming-1")]
@@ -207,6 +223,7 @@ async def test_completed_duplicate_is_read_only_and_does_not_repeat_side_effects
         "topic": "orders",
         "status": "COMPLETED",
         "attempts": 1,
+        "payload_sha256": None,
     }
     repo = AuditRepository(_FakePool(connection))  # type: ignore[arg-type]
 
@@ -214,7 +231,7 @@ async def test_completed_duplicate_is_read_only_and_does_not_repeat_side_effects
         assert tx.claim.claimed is False
         assert tx.claim.duplicate_completed is True
         with pytest.raises(RuntimeError, match="duplicate"):
-            await tx.enqueue_outbox("outgoing-1", "reports", "{}")
+            await tx.enqueue_outbox("outgoing-1", "reports", "{}", "0" * 64)
 
     assert connection.inbox[("execution", "incoming-1")]["status"] == "COMPLETED"
     assert connection.outbox == {}
@@ -227,7 +244,7 @@ async def test_missing_complete_rolls_back_and_marks_message_failed():
 
     with pytest.raises(RuntimeError, match="without complete"):
         async with repo.message_transaction("execution", "incoming-1", "orders") as tx:
-            await tx.enqueue_outbox("outgoing-1", "reports", "{}")
+            await tx.enqueue_outbox("outgoing-1", "reports", "{}", "0" * 64)
 
     assert connection.inbox[("execution", "incoming-1")]["status"] == "FAILED"
     assert connection.outbox == {}

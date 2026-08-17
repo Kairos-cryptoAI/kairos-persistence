@@ -48,6 +48,27 @@ uv run python scripts/migration_smoke.py
 uv run pytest -q -m integration
 ```
 
+## Durable runtime bus
+
+`DurableMessageBus` is the production bridge around the normal Kairos
+`MessageBus`. It starts and migrates PostgreSQL lazily, records every consumed
+wire payload, claims its stable contract `message_id`, and defers the transport
+ACK until inbox completion and every handler-produced outbox row commit.
+Existing service loops keep the usual `subscribe` / `publish` / `ack` API.
+
+```python
+transport = build_bus(settings)
+bus = DurableMessageBus(transport, service_name=settings.service_name)
+```
+
+Producer-only publishes are also committed to the outbox before the dispatcher
+sends them. Dispatch workers use `FOR UPDATE SKIP LOCKED`, expiring leases,
+bounded exponential retry and a dead-letter terminal state. A process may crash
+after Redis accepts a publish but before PostgreSQL records `published_at`; the
+row is then published again. This deliberate at-least-once boundary is safe
+because downstream inboxes reject a reused `message_id` with different topic or
+SHA-256 payload and suppress exact completed duplicates.
+
 ## Atomic inbox/business/outbox processing
 
 `AuditRepository.message_transaction()` owns one pooled connection and one
@@ -59,8 +80,9 @@ the inbox row as `FAILED`; the original exception is re-raised after commit.
 ```python
 async with repository.message_transaction(
     consumer="execution",
-    message_id=envelope.id,
+    message_id=envelope.payload["message_id"],
     topic=envelope.topic,
+    payload_sha256=canonical_payload(envelope.payload)[1],
 ) as tx:
     if tx.claim.duplicate_completed:
         # The previous delivery committed; it is safe for the bus consumer to ACK.
@@ -70,10 +92,16 @@ async with repository.message_transaction(
         return
 
     await tx.connection.execute("INSERT INTO domain_table ...")
-    await tx.enqueue_outbox(report.message_id, output_topic, report.model_dump_json())
+    payload, payload_sha256 = canonical_payload(report.to_payload())
+    await tx.enqueue_outbox(report.message_id, output_topic, payload, payload_sha256)
     await tx.complete({"report_id": report.message_id})
 ```
 
 The caller must acknowledge the Redis message only after this context manager
 returns successfully. A completed duplicate can be acknowledged without
 repeating its side effects.
+
+Migration application is serialized with a PostgreSQL advisory lock so all
+service containers may start concurrently. The database DSN must be provided
+through `KAIROS_PERSISTENCE_DATABASE_URL`; the development default is not a
+production credential.

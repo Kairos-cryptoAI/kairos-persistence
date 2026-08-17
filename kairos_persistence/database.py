@@ -46,15 +46,17 @@ class Database:
     async def migrate(self) -> None:
         """Apply immutable numbered SQL migrations exactly once."""
         migrations = Path(__file__).with_name("migrations")
+        # Every application service starts independently.  A transaction-scoped
+        # advisory lock prevents concurrent containers from racing the same DDL.
         async with self.transaction() as connection:
+            await connection.execute("SELECT pg_advisory_xact_lock($1)", 4_907_627_681_104_115_019)
             await connection.execute(
                 """CREATE TABLE IF NOT EXISTS schema_migrations (
                     version TEXT PRIMARY KEY,
                     applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )"""
             )
-        for path in sorted(migrations.glob("[0-9][0-9][0-9]_*.sql")):
-            async with self.transaction() as connection:
+            for path in sorted(migrations.glob("[0-9][0-9][0-9]_*.sql")):
                 applied = await connection.fetchval(
                     "SELECT 1 FROM schema_migrations WHERE version = $1", path.name
                 )

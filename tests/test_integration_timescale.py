@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+from datetime import timedelta
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
-from kairos_persistence import AuditRepository, Database, PersistenceSettings
+from kairos_persistence import (
+    AuditRepository,
+    Database,
+    MessageIdentityConflict,
+    PersistenceSettings,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -34,7 +41,13 @@ async def test_message_transaction_is_atomic_and_completed_duplicates_are_suppre
     try:
         async with repository.message_transaction(consumer, incoming_id, "integration.input") as tx:
             assert tx.claim.claimed
-            assert await tx.enqueue_outbox(outgoing_id, "integration.output", '{"ok":true}')
+            payload = '{"ok":true}'
+            assert await tx.enqueue_outbox(
+                outgoing_id,
+                "integration.output",
+                payload,
+                hashlib.sha256(payload.encode()).hexdigest(),
+            )
             await tx.complete({"outgoing_id": outgoing_id})
 
         async with repository.message_transaction(consumer, incoming_id, "integration.input") as tx:
@@ -77,7 +90,13 @@ async def test_message_transaction_rolls_back_side_effects_before_recording_fail
     try:
         with pytest.raises(asyncpg.PostgresError):
             async with repository.message_transaction(consumer, incoming_id, "integration.input") as tx:
-                await tx.enqueue_outbox(outgoing_id, "integration.output", '{"ok":true}')
+                payload = '{"ok":true}'
+                await tx.enqueue_outbox(
+                    outgoing_id,
+                    "integration.output",
+                    payload,
+                    hashlib.sha256(payload.encode()).hexdigest(),
+                )
                 await tx.connection.execute("SELECT 1 / 0")
 
         async with database.pool.acquire() as connection:
@@ -100,4 +119,83 @@ async def test_message_transaction_rolls_back_side_effects_before_recording_fail
                 consumer,
                 incoming_id,
             )
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_outbox_leases_retry_and_complete_without_two_workers_owning_a_row() -> None:
+    database = Database(_settings())
+    await database.connect()
+    await database.migrate()
+    repository = AuditRepository(database.pool)
+    message_id = f"outbox-lease-{uuid4().hex}"
+    payload = '{"message_id":"' + message_id + '"}'
+    payload_sha256 = hashlib.sha256(payload.encode()).hexdigest()
+
+    try:
+        async with database.transaction() as connection:
+            assert await repository.enqueue_outbox(
+                connection,
+                message_id,
+                "integration.output",
+                payload,
+                payload_sha256,
+            )
+
+        first = await repository.claim_outbox("worker-1", limit=1)
+        assert len(first) == 1
+        assert first[0].message_id == message_id
+        assert first[0].publish_attempts == 1
+        assert await repository.claim_outbox("worker-2", limit=1) == []
+
+        assert await repository.fail_outbox(
+            first[0].id,
+            "worker-1",
+            "temporary transport error",
+            retry_after=timedelta(0),
+            max_attempts=3,
+        )
+        second = await repository.claim_outbox("worker-2", limit=1)
+        assert len(second) == 1
+        assert second[0].publish_attempts == 2
+        assert await repository.mark_published(second[0].id, "worker-2")
+        assert not await repository.mark_published(second[0].id, "worker-1")
+    finally:
+        await database.pool.execute("DELETE FROM message_outbox WHERE message_id=$1", message_id)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_rejects_same_message_id_with_different_payload_fingerprint() -> None:
+    database = Database(_settings())
+    await database.connect()
+    await database.migrate()
+    repository = AuditRepository(database.pool)
+    suffix = uuid4().hex
+    consumer = f"identity-{suffix}"
+    message_id = f"incoming-{suffix}"
+
+    try:
+        async with repository.message_transaction(
+            consumer,
+            message_id,
+            "integration.input",
+            payload_sha256="a" * 64,
+        ) as transaction:
+            await transaction.complete()
+
+        with pytest.raises(MessageIdentityConflict):
+            async with repository.message_transaction(
+                consumer,
+                message_id,
+                "integration.input",
+                payload_sha256="b" * 64,
+            ):
+                pass
+    finally:
+        await database.pool.execute(
+            "DELETE FROM message_inbox WHERE consumer=$1 AND message_id=$2",
+            consumer,
+            message_id,
+        )
         await database.close()
