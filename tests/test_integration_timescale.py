@@ -223,6 +223,7 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
                 symbol="BTCUSDT",
                 client_order_id="client-1",
                 request_payload=request,
+                recovery_delay=timedelta(0),
             ),
             journal.prepare(
                 effect_key=effect_key,
@@ -231,6 +232,7 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
                 symbol="BTCUSDT",
                 client_order_id="client-1",
                 request_payload=request,
+                recovery_delay=timedelta(0),
             ),
         )
         assert {first.created, duplicate.created} == {True, False}

@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -68,8 +69,11 @@ class ExecutionJournalRepository:
         symbol: str,
         client_order_id: str | None,
         request_payload: dict[str, Any],
+        recovery_delay: timedelta = timedelta(minutes=2),
     ) -> EffectPreparation:
         self._validate_identity(effect_key, exchange, symbol, client_order_id)
+        if recovery_delay < timedelta(0):
+            raise ValueError("recovery_delay must not be negative")
         _request_json, request_sha256 = canonical_payload(request_payload)
         event_payload = {
             "effect_type": effect_type.value,
@@ -107,8 +111,9 @@ class ExecutionJournalRepository:
                 row = await connection.fetchrow(
                     """INSERT INTO execution_effects
                        (effect_key, effect_type, exchange, symbol, client_order_id,
-                        request_sha256, request_payload, status, journal_head_sha256)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'PREPARED',$8)
+                        request_sha256, request_payload, status, journal_head_sha256,
+                        recovery_after)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'PREPARED',$8,now()+$9::interval)
                        RETURNING *""",
                     effect_key,
                     effect_type.value,
@@ -118,6 +123,7 @@ class ExecutionJournalRepository:
                     request_sha256,
                     self._json(request_payload),
                     event_sha256,
+                    recovery_delay,
                 )
                 await self._append_event(
                     connection,
@@ -174,12 +180,14 @@ class ExecutionJournalRepository:
         if exchange is None:
             rows = await self.pool.fetch(
                 """SELECT * FROM execution_effects
-                   WHERE status IN ('PREPARED','FAILED') ORDER BY prepared_at, effect_key"""
+                   WHERE status IN ('PREPARED','FAILED') AND recovery_after <= now()
+                   ORDER BY prepared_at, effect_key"""
             )
         else:
             rows = await self.pool.fetch(
                 """SELECT * FROM execution_effects
                    WHERE status IN ('PREPARED','FAILED') AND exchange=$1
+                     AND recovery_after <= now()
                    ORDER BY prepared_at, effect_key""",
                 exchange,
             )
