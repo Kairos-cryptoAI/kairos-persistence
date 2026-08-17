@@ -105,3 +105,12 @@ Migration application is serialized with a PostgreSQL advisory lock so all
 service containers may start concurrently. The database DSN must be provided
 through `KAIROS_PERSISTENCE_DATABASE_URL`; the development default is not a
 production credential.
+
+## Exchange-effect journal
+
+`ExecutionJournalRepository` records each non-transactional venue mutation as
+`PREPARED` before the HTTP request, then `CONFIRMED`, `RECONCILED` or `FAILED`.
+The immutable request identity prevents a deterministic effect key from being
+reused with different content. Every transition also appends a domain-separated
+SHA-256 chained event. `recovery_required()` exposes unresolved effects so the
+execution service can reconcile them before accepting another order.

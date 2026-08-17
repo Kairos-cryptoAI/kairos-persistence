@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from datetime import timedelta
@@ -13,6 +14,9 @@ import pytest
 from kairos_persistence import (
     AuditRepository,
     Database,
+    EffectStatus,
+    EffectType,
+    ExecutionJournalRepository,
     MessageIdentityConflict,
     PersistenceSettings,
 )
@@ -198,4 +202,71 @@ async def test_inbox_rejects_same_message_id_with_different_payload_fingerprint(
             consumer,
             message_id,
         )
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() -> None:
+    database = Database(_settings())
+    await database.connect()
+    await database.migrate()
+    journal = ExecutionJournalRepository(database.pool)
+    effect_key = f"evedex:PLACE_ORDER:{uuid4().hex}"
+    request = {"symbol": "BTCUSDT", "quantity": 0.001, "side": "BUY"}
+
+    try:
+        first, duplicate = await asyncio.gather(
+            journal.prepare(
+                effect_key=effect_key,
+                effect_type=EffectType.PLACE_ORDER,
+                exchange="evedex",
+                symbol="BTCUSDT",
+                client_order_id="client-1",
+                request_payload=request,
+            ),
+            journal.prepare(
+                effect_key=effect_key,
+                effect_type=EffectType.PLACE_ORDER,
+                exchange="evedex",
+                symbol="BTCUSDT",
+                client_order_id="client-1",
+                request_payload=request,
+            ),
+        )
+        assert first == duplicate
+        assert first.status is EffectStatus.PREPARED
+        assert [item.effect_key for item in await journal.recovery_required(exchange="evedex")] == [
+            effect_key
+        ]
+
+        confirmed = await journal.confirm(
+            effect_key,
+            exchange_effect_id="client-1",
+            response_payload={"status": "NEW"},
+        )
+        assert confirmed.status is EffectStatus.CONFIRMED
+        reconciled = await journal.reconcile(effect_key)
+        assert reconciled.status is EffectStatus.RECONCILED
+        assert await journal.recovery_required(exchange="evedex") == []
+        assert await journal.verify_chain(effect_key)
+
+        with pytest.raises(MessageIdentityConflict):
+            await journal.prepare(
+                effect_key=effect_key,
+                effect_type=EffectType.PLACE_ORDER,
+                exchange="evedex",
+                symbol="BTCUSDT",
+                client_order_id="client-1",
+                request_payload={**request, "quantity": 0.002},
+            )
+
+        await database.pool.execute(
+            """UPDATE execution_effect_events SET event_payload='{"tampered":true}'::jsonb
+               WHERE effect_key=$1 AND phase='CONFIRMED'""",
+            effect_key,
+        )
+        assert not await journal.verify_chain(effect_key)
+    finally:
+        await database.pool.execute("DELETE FROM execution_effect_events WHERE effect_key=$1", effect_key)
+        await database.pool.execute("DELETE FROM execution_effects WHERE effect_key=$1", effect_key)
         await database.close()

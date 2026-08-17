@@ -108,6 +108,10 @@ class DurableMessageBus(MessageBus):
                 self._dispatch_outbox(), name=f"{self.service_name}-outbox"
             )
 
+    async def start(self) -> None:
+        """Connect, migrate and start dispatch before another runtime component uses the pool."""
+        await self._ensure_started()
+
     def _repository(self) -> AuditRepository:
         if self.repository is None:
             raise RuntimeError("durable bus is not started")
