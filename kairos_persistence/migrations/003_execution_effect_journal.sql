@@ -37,4 +37,3 @@ CREATE TABLE IF NOT EXISTS execution_effect_events (
 );
 CREATE INDEX IF NOT EXISTS execution_effect_events_key_sequence_idx
     ON execution_effect_events(effect_key, sequence);
-
