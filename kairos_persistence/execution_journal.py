@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -182,6 +184,24 @@ class ExecutionJournalRepository:
                 exchange,
             )
         return [self._record(row) for row in rows]
+
+    @asynccontextmanager
+    async def recovery_lock(self, effect_key: str) -> AsyncIterator[None]:
+        """Hold a cross-process session lock while reconciling one external effect."""
+        if not effect_key.strip():
+            raise ValueError("effect_key must not be empty")
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+                effect_key,
+            )
+            try:
+                yield
+            finally:
+                await connection.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+                    effect_key,
+                )
 
     async def verify_chain(self, effect_key: str) -> bool:
         rows = await self.pool.fetch(
