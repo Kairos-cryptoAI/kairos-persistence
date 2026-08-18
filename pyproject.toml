@@ -15,6 +15,9 @@ dependencies = [
     "structlog>=24.1,<27",
 ]
 
+[project.scripts]
+kairos-persistence-exporter = "kairos_persistence.metrics_exporter:main"
+
 [dependency-groups]
 dev = [
     "bandit>=1.8,<2",

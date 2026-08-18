@@ -114,3 +114,13 @@ The immutable request identity prevents a deterministic effect key from being
 reused with different content. Every transition also appends a domain-separated
 SHA-256 chained event. `recovery_required()` exposes unresolved effects so the
 execution service can reconcile them before accepting another order.
+
+## Runtime metrics
+
+`kairos-persistence-exporter` exposes a small Prometheus endpoint without a
+Docker-socket mount. It authenticates to Redis with `KAIROS_REDIS_URL`, queries
+TimescaleDB through `KAIROS_PERSISTENCE_DATABASE_URL`, and reports connectivity,
+pending/dead-lettered outbox rows, processing/failed inbox rows, unresolved/failed
+execution effects, and the oldest unpublished message age. The exporter performs
+read-only queries and an authenticated Redis `PING`; database or Redis failure is
+returned as a zero health gauge rather than fabricated healthy metrics.
