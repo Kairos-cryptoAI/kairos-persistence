@@ -17,6 +17,14 @@ from .repository import (
     OutboxRecord,
 )
 from .runtime import DurableMessageBus, canonical_payload
+from .source_state import (
+    MonthlySourceUsage,
+    SourceBudgetExceeded,
+    SourceCursor,
+    SourceStateRepository,
+    UsageReservation,
+    UsageStatus,
+)
 
 __all__ = [
     "AuditRepository",
@@ -32,5 +40,11 @@ __all__ = [
     "MessageIdentityConflict",
     "OutboxRecord",
     "PersistenceSettings",
+    "MonthlySourceUsage",
+    "SourceBudgetExceeded",
+    "SourceCursor",
+    "SourceStateRepository",
+    "UsageReservation",
+    "UsageStatus",
     "canonical_payload",
 ]

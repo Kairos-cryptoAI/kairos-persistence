@@ -3,6 +3,12 @@
 Transactional PostgreSQL/TimescaleDB primitives for Kairos: event audit,
 idempotent inbox processing, transactional outbox delivery and execution state.
 
+Paid feed clients also use `SourceStateRepository` for monotonic per-source
+cursors and monthly usage reservations. Capacity is reserved transactionally
+before a metered request, then committed to the actual returned units or
+released on a request failure. Costs use integer micro-USD amounts, so restarts
+and concurrent workers cannot silently cross the configured monthly cap.
+
 ## Local development
 
 The repository is locked with `uv` 0.12.3 and defaults to Python 3.11. The CI

@@ -19,6 +19,9 @@ from kairos_persistence import (
     ExecutionJournalRepository,
     MessageIdentityConflict,
     PersistenceSettings,
+    SourceBudgetExceeded,
+    SourceStateRepository,
+    UsageStatus,
 )
 
 pytestmark = pytest.mark.integration
@@ -272,4 +275,80 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
     finally:
         await database.pool.execute("DELETE FROM execution_effect_events WHERE effect_key=$1", effect_key)
         await database.pool.execute("DELETE FROM execution_effects WHERE effect_key=$1", effect_key)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_source_cursor_and_paid_usage_survive_restart_without_budget_overshoot() -> None:
+    database = Database(_settings())
+    await database.connect()
+    await database.migrate()
+    repository = SourceStateRepository(database.pool)
+    suffix = uuid4().hex
+    service = f"text-integration-{suffix}"
+    source = "x-api"
+    cursor_key = "lookonchain"
+    first_request = f"request-1-{suffix}"
+    second_request = f"request-2-{suffix}"
+
+    try:
+        assert await repository.advance_cursor(service, source, cursor_key, "100")
+        assert not await repository.advance_cursor(service, source, cursor_key, "100")
+        with pytest.raises(ValueError, match="regression"):
+            await repository.advance_cursor(service, source, cursor_key, "99")
+        cursor = await SourceStateRepository(database.pool).get_cursor(service, source, cursor_key)
+        assert cursor is not None
+        assert cursor.cursor_value == "100"
+
+        reservation = await repository.reserve_usage(
+            service=service,
+            source=source,
+            reservation_id=first_request,
+            reserved_units=2,
+            unit_cost_microusd=5_000,
+            monthly_budget_microusd=10_000,
+        )
+        assert reservation.status is UsageStatus.RESERVED
+        with pytest.raises(SourceBudgetExceeded):
+            await repository.reserve_usage(
+                service=service,
+                source=source,
+                reservation_id=second_request,
+                reserved_units=1,
+                unit_cost_microusd=5_000,
+                monthly_budget_microusd=10_000,
+            )
+
+        committed = await repository.commit_usage(service, source, first_request, actual_units=1)
+        assert committed.status is UsageStatus.COMMITTED
+        assert committed.actual_cost_microusd == 5_000
+        released = await repository.reserve_usage(
+            service=service,
+            source=source,
+            reservation_id=second_request,
+            reserved_units=1,
+            unit_cost_microusd=5_000,
+            monthly_budget_microusd=10_000,
+        )
+        assert released.status is UsageStatus.RESERVED
+        assert (
+            await repository.release_usage(service, source, second_request)
+        ).status is UsageStatus.RELEASED
+
+        usage = await repository.monthly_usage(service, source)
+        assert usage.committed_units == 1
+        assert usage.committed_cost_microusd == 5_000
+        assert usage.reserved_units == 0
+        assert usage.budgeted_cost_microusd == 5_000
+    finally:
+        await database.pool.execute(
+            "DELETE FROM source_usage_reservations WHERE service=$1 AND source=$2",
+            service,
+            source,
+        )
+        await database.pool.execute(
+            "DELETE FROM source_cursors WHERE service=$1 AND source=$2",
+            service,
+            source,
+        )
         await database.close()
