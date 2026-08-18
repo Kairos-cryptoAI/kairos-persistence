@@ -9,6 +9,12 @@ before a metered request, then committed to the actual returned units or
 released on a request failure. Costs use integer micro-USD amounts, so restarts
 and concurrent workers cannot silently cross the configured monthly cap.
 
+`DurableLLMUsageBudget` exposes the same ledger as a provider-wide microdollar
+budget for `kairos-llm`. Text Scouts, Aggregator and Macro all write under the
+shared `kairos-llm-v1/<provider>` identity, so concurrent services cannot each
+spend a separate copy of the monthly OpenAI or DeepSeek allowance. One unit is
+one microdollar; a provider call is admitted only after the reservation commits.
+
 ## Local development
 
 The repository is locked with `uv` 0.12.3 and defaults to Python 3.11. The CI

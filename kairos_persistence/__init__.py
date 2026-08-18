@@ -25,11 +25,13 @@ from .source_state import (
     UsageReservation,
     UsageStatus,
 )
+from .usage_budget import LLM_BUDGET_SERVICE, DurableLLMUsageBudget
 
 __all__ = [
     "AuditRepository",
     "Database",
     "DurableMessageBus",
+    "DurableLLMUsageBudget",
     "EffectStatus",
     "EffectPreparation",
     "EffectType",
@@ -46,5 +48,6 @@ __all__ = [
     "SourceStateRepository",
     "UsageReservation",
     "UsageStatus",
+    "LLM_BUDGET_SERVICE",
     "canonical_payload",
 ]
