@@ -32,22 +32,81 @@ def _canary(
     now_ms: int,
     *,
     symbol: str = "BTCUSDT",
+    metadata_updates: dict[str, str] | None = None,
+    include_instrument_evidence: bool = True,
+    instrument_content_sha256: str | None = None,
+    instrument_reference: str | None = None,
+    route_evidence_ids: tuple[str, ...] | None = None,
 ) -> tuple[CandidateReviewV1, StrategicAllocation]:
     eligible_ms = (now_ms // 60_000 + 1) * 60_000
     bar_sha256 = "e" * 64
-    evidence = (
+    venue_updated_at_ms = eligible_ms - 1
+    venue_symbols = {
+        "BTCUSDT": "BTCUSD:DEV",
+        "ETHUSDT": "ETHUSD:DEV",
+        "SOLUSDT": "SOLUSD:DEV",
+        "BNBUSDT": "BNBUSD:DEV",
+        "XRPUSDT": "XRPUSD:DEV",
+    }
+    venue_symbol = venue_symbols[symbol]
+    instrument_rule = {
+        "domain": "evedex-dev-instrument-rule.v1",
+        "venue_symbol": venue_symbol,
+        "venue_trading": "all",
+        "venue_market_state": "OPEN",
+        "venue_updated_at_ms": venue_updated_at_ms,
+        "venue_lot_size": "1",
+        "venue_price_increment": "0.1",
+        "venue_quantity_increment": "0.001",
+        "venue_multiplier": "1",
+        "venue_min_volume_usd": "5",
+        "venue_min_price": "0.1",
+        "venue_max_price": "1000000",
+        "venue_min_quantity": "0.001",
+        "venue_max_quantity": "1000",
+    }
+    instrument_sha256 = canonical_sha256(instrument_rule)
+    evidence_items = [
         EvidenceReferenceV1(
             kind="closed_bar",
             reference=f"BINANCE_UM:{symbol}:{eligible_ms - 60_000}",
             content_sha256=bar_sha256,
             observed_at_ms=eligible_ms - 1,
-        ),
-    )
-    venue_symbols = {
-        "BTCUSDT": "BTCUSD:DEV",
-        "ETHUSDT": "ETHUSD:DEV",
-        "SOLUSDT": "SOLUSD:DEV",
+        )
+    ]
+    if include_instrument_evidence:
+        evidence_items.append(
+            EvidenceReferenceV1(
+                kind="venue_instrument",
+                reference=instrument_reference or f"EVEDEX_DEV:{venue_symbol}:{venue_updated_at_ms}",
+                content_sha256=instrument_content_sha256 or instrument_sha256,
+                observed_at_ms=venue_updated_at_ms,
+            )
+        )
+    evidence = tuple(evidence_items)
+    metadata = {
+        "account_id": "paper-canary-test",
+        "alpha_claim": "false",
+        "canary_entry_order": "MARKETABLE_IOC_LIMIT",
+        "canary_quantity": "0.05",
+        "entry_policy": "NEXT_BAR_MARKET",
+        "instrument_rules_sha256": instrument_sha256,
+        "purpose": "technical_execution_canary",
+        "venue_lot_size": "1",
+        "venue_market_state": "OPEN",
+        "venue_max_price": "1000000",
+        "venue_max_quantity": "1000",
+        "venue_min_price": "0.1",
+        "venue_min_quantity": "0.001",
+        "venue_min_volume_usd": "5",
+        "venue_multiplier": "1",
+        "venue_price_increment": "0.1",
+        "venue_quantity_increment": "0.001",
+        "venue_symbol": venue_symbol,
+        "venue_trading": "all",
+        "venue_updated_at_ms": str(venue_updated_at_ms),
     }
+    metadata.update(metadata_updates or {})
     intent = StrategyIntentV1(
         source="kairos-paper-canary",
         strategy_id="technical-canary",
@@ -73,13 +132,7 @@ def _canary(
             input_bar_sha256s=(bar_sha256,),
         ),
         evidence=evidence,
-        metadata=(
-            ("account_id", "paper-canary-test"),
-            ("alpha_claim", "false"),
-            ("entry_policy", "NEXT_BAR_MARKET"),
-            ("purpose", "technical_execution_canary"),
-            ("venue_symbol", venue_symbols[symbol]),
-        ),
+        metadata=tuple(metadata.items()),
     )
     route = CandidateRouteV1(
         source="kairos-paper-canary",
@@ -90,7 +143,7 @@ def _canary(
         causation_id=intent.message_id,
         routed_at_ms=eligible_ms - 1,
         review_deadline_ms=eligible_ms + 60_000,
-        evidence_ids=(bar_sha256,),
+        evidence_ids=route_evidence_ids or (bar_sha256, instrument_sha256),
     )
     review = CandidateReviewV1(
         source="kairos-paper-canary",
@@ -156,6 +209,93 @@ def test_canary_binding_is_exact_and_does_not_accept_macro_substitution() -> Non
         )
     with pytest.raises(ValueError, match="account does not match"):
         PaperCanaryArmRepository._validate_account_binding("another-paper-account", review)
+
+
+def test_canary_binding_rejects_instrument_rule_tampering_and_noncanonical_decimals() -> None:
+    tampered, tampered_allocation = _canary(
+        1_800_000_000_000,
+        metadata_updates={"venue_trading": "partial"},
+    )
+    with pytest.raises(ValueError, match="fixed DEV policy"):
+        PaperCanaryArmRepository._validate_binding(tampered, tampered_allocation)
+
+    noncanonical, noncanonical_allocation = _canary(
+        1_800_000_000_000,
+        metadata_updates={"canary_quantity": "0.050"},
+    )
+    with pytest.raises(ValueError, match="canonical positive decimal"):
+        PaperCanaryArmRepository._validate_binding(noncanonical, noncanonical_allocation)
+
+    misaligned, misaligned_allocation = _canary(
+        1_800_000_000_000,
+        metadata_updates={"canary_quantity": "0.0505"},
+    )
+    with pytest.raises(ValueError, match="exact venue quantity increment"):
+        PaperCanaryArmRepository._validate_binding(misaligned, misaligned_allocation)
+
+
+def test_canary_binding_rejects_missing_or_tampered_instrument_evidence_and_hash() -> None:
+    missing, missing_allocation = _canary(
+        1_800_000_000_000,
+        include_instrument_evidence=False,
+    )
+    with pytest.raises(ValueError, match="closed-bar and venue-instrument evidence"):
+        PaperCanaryArmRepository._validate_binding(missing, missing_allocation)
+
+    wrong_reference, wrong_reference_allocation = _canary(
+        1_800_000_000_000,
+        instrument_reference="EVEDEX_DEV:BTCUSD:DEV:1",
+    )
+    with pytest.raises(ValueError, match="venue-instrument evidence"):
+        PaperCanaryArmRepository._validate_binding(wrong_reference, wrong_reference_allocation)
+
+    forged_sha = "f" * 64
+    forged, forged_allocation = _canary(
+        1_800_000_000_000,
+        metadata_updates={"instrument_rules_sha256": forged_sha},
+        instrument_content_sha256=forged_sha,
+        route_evidence_ids=("e" * 64, forged_sha),
+    )
+    with pytest.raises(ValueError, match="canonical payload"):
+        PaperCanaryArmRepository._validate_binding(forged, forged_allocation)
+
+    wrong_lineage, wrong_lineage_allocation = _canary(
+        1_800_000_000_000,
+        route_evidence_ids=("e" * 64, "f" * 64),
+    )
+    with pytest.raises(ValueError, match="bar and instrument-rule lineage"):
+        PaperCanaryArmRepository._validate_binding(wrong_lineage, wrong_lineage_allocation)
+
+
+def test_canary_binding_rejects_tampered_bar_provenance_and_misaligned_rules() -> None:
+    review, allocation = _canary(1_800_000_000_000)
+    evidence = list(review.intent.evidence)
+    bar_index = next(index for index, item in enumerate(evidence) if item.kind == "closed_bar")
+    evidence[bar_index] = evidence[bar_index].model_copy(update={"reference": "BINANCE_UM:BTCUSDT:1"})
+    intent = review.intent.model_copy(update={"evidence": tuple(evidence)})
+    route = review.route.model_copy(update={"intent": intent})
+    tampered_review = review.model_copy(
+        update={"intent": intent, "route": route, "evidence": intent.evidence}
+    )
+    with pytest.raises(ValueError, match="closed-bar evidence"):
+        PaperCanaryArmRepository._validate_binding(tampered_review, allocation)
+
+    bad_price, bad_price_allocation = _canary(
+        1_800_000_000_000,
+        metadata_updates={"venue_min_price": "0.15"},
+    )
+    with pytest.raises(ValueError, match="price bounds are not exact"):
+        PaperCanaryArmRepository._validate_binding(bad_price, bad_price_allocation)
+
+    bad_min_quantity, bad_min_quantity_allocation = _canary(
+        1_800_000_000_000,
+        metadata_updates={"venue_min_quantity": "0.0015"},
+    )
+    with pytest.raises(ValueError, match="min quantity is not an exact"):
+        PaperCanaryArmRepository._validate_binding(
+            bad_min_quantity,
+            bad_min_quantity_allocation,
+        )
 
 
 @pytest.mark.integration

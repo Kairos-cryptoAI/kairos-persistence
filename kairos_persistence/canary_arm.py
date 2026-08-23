@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import asyncpg
@@ -30,6 +32,36 @@ CANARY_VENUE_SYMBOLS = {
     "BNBUSDT": "BNBUSD:DEV",
     "XRPUSDT": "XRPUSD:DEV",
 }
+CANARY_INSTRUMENT_RULE_DOMAIN = "evedex-dev-instrument-rule.v1"
+CANARY_INSTRUMENT_DECIMAL_FIELDS = (
+    "venue_lot_size",
+    "venue_price_increment",
+    "venue_quantity_increment",
+    "venue_multiplier",
+    "venue_min_volume_usd",
+    "venue_min_price",
+    "venue_max_price",
+    "venue_min_quantity",
+    "venue_max_quantity",
+)
+CANARY_METADATA_KEYS = frozenset(
+    {
+        "account_id",
+        "alpha_claim",
+        "canary_entry_order",
+        "canary_quantity",
+        "entry_policy",
+        "instrument_rules_sha256",
+        "purpose",
+        *CANARY_INSTRUMENT_DECIMAL_FIELDS,
+        "venue_market_state",
+        "venue_symbol",
+        "venue_trading",
+        "venue_updated_at_ms",
+    }
+)
+_CANONICAL_POSITIVE_DECIMAL = re.compile(r"(?:[1-9][0-9]*|0\.[0-9]*[1-9]|[1-9][0-9]*\.[0-9]*[1-9])")
+_CANONICAL_POSITIVE_INTEGER = re.compile(r"[1-9][0-9]*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,27 +294,25 @@ class PaperCanaryArmRepository:
             or review.reviewed_at_ms != intent.entry_eligible_ts_ms
         ):
             raise ValueError("manual canary review must preserve the exact fixed route")
-        if (
-            intent.signal_strength != 0.0
-            or intent.entry_eligible_ts_ms != intent.decision_ts_ms + 1
-            or len(intent.evidence) != 1
-            or intent.evidence[0].kind != "closed_bar"
-            or intent.evidence[0].content_sha256 is None
-            or route.evidence_ids != (intent.evidence[0].content_sha256,)
-        ):
-            raise ValueError("manual canary intent must be bound to one closed bar")
+        if intent.signal_strength != 0.0 or intent.entry_eligible_ts_ms != intent.decision_ts_ms + 1:
+            raise ValueError("manual canary intent must preserve the fixed signal policy")
         metadata = dict(intent.metadata)
         expected_venue_symbol = CANARY_VENUE_SYMBOLS.get(intent.symbol)
-        if expected_venue_symbol is None or metadata != {
-            "account_id": metadata.get("account_id"),
-            "alpha_claim": "false",
-            "entry_policy": "NEXT_BAR_MARKET",
-            "purpose": "technical_execution_canary",
-            "venue_symbol": expected_venue_symbol,
-        }:
+        if expected_venue_symbol is None or set(metadata) != CANARY_METADATA_KEYS:
+            raise ValueError("manual canary intent metadata is not the fixed DEV policy")
+        if (
+            metadata["alpha_claim"] != "false"
+            or metadata["canary_entry_order"] != "MARKETABLE_IOC_LIMIT"
+            or metadata["entry_policy"] != "NEXT_BAR_MARKET"
+            or metadata["purpose"] != "technical_execution_canary"
+            or metadata["venue_market_state"] != "OPEN"
+            or metadata["venue_symbol"] != expected_venue_symbol
+            or metadata["venue_trading"] != "all"
+        ):
             raise ValueError("manual canary intent metadata is not the fixed DEV policy")
         if not metadata["account_id"]:
             raise ValueError("manual canary intent requires an account binding")
+        PaperCanaryArmRepository._validate_instrument_binding(review, metadata)
         if set(allocation.strategy_weights) != {CANARY_STRATEGY_ID} or not math.isclose(
             allocation.strategy_weights[CANARY_STRATEGY_ID],
             CANARY_WEIGHT,
@@ -328,6 +358,85 @@ class PaperCanaryArmRepository:
         }
         if allocation.message_id != canonical_payload(allocation_identity)[1]:
             raise ValueError("manual canary allocation message_id is not deterministic")
+
+    @staticmethod
+    def _validate_instrument_binding(
+        review: CandidateReviewV1,
+        metadata: dict[str, str],
+    ) -> None:
+        intent = review.intent
+        route = review.route
+        if len(intent.evidence) != 2:
+            raise ValueError("manual canary intent requires closed-bar and venue-instrument evidence")
+        evidence_by_kind = {item.kind: item for item in intent.evidence}
+        if set(evidence_by_kind) != {"closed_bar", "venue_instrument"}:
+            raise ValueError("manual canary intent requires closed-bar and venue-instrument evidence")
+        closed_bar = evidence_by_kind["closed_bar"]
+        instrument = evidence_by_kind["venue_instrument"]
+        input_bars = intent.provenance.input_bar_sha256s
+        expected_bar_reference = f"BINANCE_UM:{intent.symbol}:{intent.decision_ts_ms - 59_999}"
+        if (
+            len(input_bars) != 1
+            or closed_bar.content_sha256 != input_bars[0]
+            or closed_bar.reference != expected_bar_reference
+            or closed_bar.observed_at_ms != intent.decision_ts_ms
+        ):
+            raise ValueError("manual canary closed-bar evidence does not match intent provenance")
+
+        decimals = {
+            field: PaperCanaryArmRepository._positive_decimal(metadata[field], field=field)
+            for field in (*CANARY_INSTRUMENT_DECIMAL_FIELDS, "canary_quantity")
+        }
+        if metadata["venue_lot_size"] != "1" or metadata["venue_multiplier"] != "1":
+            raise ValueError("manual canary instrument lot size and multiplier must both equal 1")
+        if decimals["venue_min_price"] >= decimals["venue_max_price"]:
+            raise ValueError("manual canary instrument price bounds are inconsistent")
+        if decimals["venue_min_quantity"] > decimals["venue_max_quantity"]:
+            raise ValueError("manual canary instrument quantity bounds are inconsistent")
+        if (
+            decimals["venue_min_price"] % decimals["venue_price_increment"] != 0
+            or decimals["venue_max_price"] % decimals["venue_price_increment"] != 0
+        ):
+            raise ValueError("manual canary instrument price bounds are not exact price increments")
+        if decimals["venue_min_quantity"] % decimals["venue_quantity_increment"] != 0:
+            raise ValueError("manual canary min quantity is not an exact quantity increment")
+        quantity = decimals["canary_quantity"]
+        if not decimals["venue_min_quantity"] <= quantity <= decimals["venue_max_quantity"]:
+            raise ValueError("manual canary quantity is outside venue min/max quantity")
+        if quantity % decimals["venue_quantity_increment"] != 0:
+            raise ValueError("manual canary quantity is not an exact venue quantity increment")
+
+        updated_at_text = metadata["venue_updated_at_ms"]
+        if _CANONICAL_POSITIVE_INTEGER.fullmatch(updated_at_text) is None:
+            raise ValueError("venue_updated_at_ms must be a canonical positive integer")
+        updated_at_ms = int(updated_at_text)
+        rule_payload: dict[str, str | int] = {
+            "domain": CANARY_INSTRUMENT_RULE_DOMAIN,
+            "venue_symbol": metadata["venue_symbol"],
+            "venue_trading": metadata["venue_trading"],
+            "venue_market_state": metadata["venue_market_state"],
+            "venue_updated_at_ms": updated_at_ms,
+        }
+        rule_payload.update({field: metadata[field] for field in CANARY_INSTRUMENT_DECIMAL_FIELDS})
+        expected_rule_sha = canonical_payload(rule_payload)[1]
+        if metadata["instrument_rules_sha256"] != expected_rule_sha:
+            raise ValueError("manual canary instrument rule hash does not match its canonical payload")
+        if (
+            instrument.content_sha256 != expected_rule_sha
+            or instrument.reference
+            != f"EVEDEX_DEV:{metadata['venue_symbol']}:{metadata['venue_updated_at_ms']}"
+            or instrument.observed_at_ms != updated_at_ms
+        ):
+            raise ValueError("manual canary venue-instrument evidence does not match the fixed DEV rule")
+        expected_evidence_ids = tuple(sorted((closed_bar.content_sha256, expected_rule_sha)))
+        if route.evidence_ids != expected_evidence_ids:
+            raise ValueError("manual canary route must preserve bar and instrument-rule lineage")
+
+    @staticmethod
+    def _positive_decimal(value: str, *, field: str) -> Decimal:
+        if _CANONICAL_POSITIVE_DECIMAL.fullmatch(value) is None:
+            raise ValueError(f"{field} must be a canonical positive decimal string")
+        return Decimal(value)
 
     @staticmethod
     def _validate_account_binding(account_id: str, review: CandidateReviewV1) -> None:
