@@ -57,6 +57,10 @@ async def test_operations_query_covers_strict_paper_audit_and_lifecycle_tables()
         assert metrics.closed_bar_gaps_24h >= 0
         assert 0 <= metrics.closed_bar_minimum_coverage_ratio_24h <= 1
         assert 0 <= metrics.venue_availability_ratio_24h <= 1
+        assert metrics.venue_poll_expected_24h >= 0
+        assert metrics.venue_poll_attempted_24h >= 0
+        assert metrics.venue_poll_succeeded_24h >= 0
+        assert metrics.venue_poll_failed_24h >= 0
         assert metrics.venue_max_book_age_ms >= 0
         assert metrics.venue_max_timestamp_skew_ms >= 0
         assert metrics.paper_unprotected_trades >= 0
@@ -65,6 +69,109 @@ async def test_operations_query_covers_strict_paper_audit_and_lifecycle_tables()
         assert metrics.execution_runtime_health_age_seconds >= -1
         assert metrics.evedex_local_mutation_reserve >= -1
     finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_venue_availability_uses_durable_attempt_outcomes_and_dynamic_schedule() -> None:
+    database = Database(_settings())
+    await database.connect()
+    await database.migrate()
+    repository = AuditRepository(database.pool)
+    source = f"venue-poll-integration-{uuid4().hex}"
+    config_fingerprint = hashlib.sha256(source.encode()).hexdigest()
+    now = datetime.now(UTC)
+    scheduled_at_ms = int((now - timedelta(seconds=1)).timestamp() * 1_000)
+    expected_symbols = ["BTCUSD:DEV", "ETHUSD:DEV"]
+    statuses = ("SUCCEEDED", "SUCCEEDED", "FAILED")
+
+    try:
+        for index, status in enumerate(statuses):
+            poll_id = hashlib.sha256(f"{source}:{index}".encode()).hexdigest()
+            common = {
+                "schema_version": "1.0",
+                "source": source,
+                "contract_version": "venue-poll.v1",
+                "poll_id": poll_id,
+                "config_fingerprint": config_fingerprint,
+                "binance_symbol": "BTCUSDT" if index % 2 == 0 else "ETHUSDT",
+                "venue_symbol": expected_symbols[index % 2],
+                "expected_symbols": expected_symbols,
+                "interval_ms": 60_000,
+                "scheduled_at_ms": scheduled_at_ms - index,
+                "attempted_at_ms": scheduled_at_ms,
+                "completed_at_ms": None,
+                "failure_code": None,
+            }
+            attempt = {
+                **common,
+                "message_id": hashlib.sha256(f"{poll_id}:attempt".encode()).hexdigest(),
+                "produced_at": now.isoformat(),
+                "status": "ATTEMPTED",
+            }
+            assert await repository.append_payload("kairos.venue.poll.v1", attempt)
+            terminal = {
+                **common,
+                "message_id": hashlib.sha256(f"{poll_id}:terminal".encode()).hexdigest(),
+                "produced_at": (now + timedelta(milliseconds=1)).isoformat(),
+                "status": status,
+                "completed_at_ms": scheduled_at_ms + 1,
+                "failure_code": "TimeoutError" if status == "FAILED" else None,
+            }
+            assert await repository.append_payload("kairos.venue.poll.v1", terminal)
+
+        async def redis_probe(_url: str) -> bool:
+            return True
+
+        metrics = await collect_runtime_metrics(
+            database.pool,
+            redis_url="redis://unused",
+            redis_probe=redis_probe,
+        )
+        assert metrics.venue_poll_expected_24h == 2_880
+        assert metrics.venue_poll_attempted_24h == 3
+        assert metrics.venue_poll_succeeded_24h == 2
+        assert metrics.venue_poll_failed_24h == 1
+        assert metrics.venue_availability_ratio_24h == pytest.approx(2 / 2_880)
+    finally:
+        await database.pool.execute("DELETE FROM event_audit WHERE source=$1", source)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_processing_inbox_is_visible_to_recovery_monitoring() -> None:
+    database = Database(_settings())
+    await database.connect()
+    await database.migrate()
+    consumer = f"expired-inbox-{uuid4().hex}"
+    message_id = uuid4().hex
+
+    try:
+        await database.pool.execute(
+            """INSERT INTO message_inbox
+               (consumer, message_id, topic, status, lease_until, first_seen_at, updated_at)
+               VALUES ($1,$2,'integration.input','PROCESSING',now()-interval '2 minutes',
+                       now()-interval '3 minutes',now()-interval '3 minutes')""",
+            consumer,
+            message_id,
+        )
+
+        async def redis_probe(_url: str) -> bool:
+            return True
+
+        metrics = await collect_runtime_metrics(
+            database.pool,
+            redis_url="redis://unused",
+            redis_probe=redis_probe,
+        )
+        assert metrics.inbox_expired_processing >= 1
+        assert metrics.oldest_inbox_processing_age_seconds >= 180
+    finally:
+        await database.pool.execute(
+            "DELETE FROM message_inbox WHERE consumer=$1 AND message_id=$2",
+            consumer,
+            message_id,
+        )
         await database.close()
 
 

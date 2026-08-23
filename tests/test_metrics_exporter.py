@@ -1,6 +1,7 @@
 import pytest
 
 from kairos_persistence.metrics_exporter import (
+    _QUERY,
     RuntimeMetrics,
     _resp_command,
     collect_runtime_metrics,
@@ -45,6 +46,8 @@ async def test_collects_database_and_authenticated_redis_health():
         "outbox_dead_lettered": 1,
         "inbox_processing": 3,
         "inbox_failed": 4,
+        "oldest_inbox_processing_age_seconds": 11.0,
+        "inbox_expired_processing": 1,
         "execution_prepared": 5,
         "execution_failed": 6,
         "oldest_outbox_age_seconds": 7.5,
@@ -54,6 +57,10 @@ async def test_collects_database_and_authenticated_redis_health():
         "latest_closed_bar_age_seconds": 65.0,
         "venue_measurements_24h": 120,
         "venue_availability_ratio_24h": 0.99,
+        "venue_poll_expected_24h": 14_400,
+        "venue_poll_attempted_24h": 14_350,
+        "venue_poll_succeeded_24h": 14_256,
+        "venue_poll_failed_24h": 94,
         "venue_blocked_24h": 2,
         "venue_p95_abs_basis_bps": 3.1,
         "venue_p95_spread_bps": 4.2,
@@ -132,6 +139,12 @@ async def test_collects_database_and_authenticated_redis_health():
         60.0,
         0,
         -1,
+        14_400,
+        14_350,
+        14_256,
+        94,
+        11.0,
+        1,
     )
     rendered = render_prometheus(metrics).decode()
     assert "kairos_outbox_pending 2" in rendered
@@ -139,6 +152,8 @@ async def test_collects_database_and_authenticated_redis_health():
     assert "kairos_closed_bar_gaps_24h 0" in rendered
     assert "kairos_closed_bar_minimum_coverage_ratio_24h 1.0" in rendered
     assert "kairos_venue_availability_ratio_24h 0.99" in rendered
+    assert "kairos_venue_poll_expected_24h 14400" in rendered
+    assert "kairos_venue_poll_succeeded_24h 14256" in rendered
     assert "kairos_venue_p95_spread_bps 4.2" in rendered
     assert "kairos_venue_max_book_age_ms 1500" in rendered
     assert "kairos_paper_unprotected_trades 0" in rendered
@@ -147,6 +162,8 @@ async def test_collects_database_and_authenticated_redis_health():
     assert "kairos_evedex_local_mutation_reserve 27" in rendered
     assert "kairos_evedex_local_mutation_compensation_reserve 4" in rendered
     assert "kairos_evedex_venue_rate_limit_reserve -1" in rendered
+    assert "kairos_inbox_processing_oldest_age_seconds 11.0" in rendered
+    assert "kairos_inbox_processing_expired 1" in rendered
 
 
 @pytest.mark.asyncio
@@ -163,6 +180,17 @@ async def test_database_failure_is_exposed_without_hiding_redis_health():
     assert metrics.persistence_up == 0
     assert metrics.redis_up == 1
     assert metrics.outbox_pending == 0
+    assert metrics.latest_paper_account_age_seconds == -1
+    assert metrics.oldest_inbox_processing_age_seconds == -1
+
+
+def test_operations_query_is_fail_closed_for_polling_and_paper_reconciliation():
+    assert "/ 14400" not in _QUERY
+    assert "topic='kairos.venue.poll.v1'" in _QUERY
+    assert "payload->>'trading_mode'='PAPER'" in _QUERY
+    assert "payload->>'evedex_profile'='DEV'" in _QUERY
+    assert "payload->>'reconciled'='true'" in _QUERY
+    assert "HAVING count(DISTINCT venue_poll_facts.status)=1" in _QUERY
 
 
 def test_resp_command_does_not_embed_protocol_ambiguity():

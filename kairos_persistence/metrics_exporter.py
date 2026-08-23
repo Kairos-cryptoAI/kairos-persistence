@@ -45,7 +45,7 @@ class RuntimeMetrics:
     paper_unprotected_trades: int = 0
     paper_recovery_blocked: int = 0
     execution_p95_shortfall_bps: float = 0.0
-    latest_paper_account_age_seconds: float = 0.0
+    latest_paper_account_age_seconds: float = -1.0
     api_spend_month_usd: float = 0.0
     execution_runtime_health_age_seconds: float = -1.0
     evedex_auth_age_seconds: float = -1.0
@@ -56,12 +56,20 @@ class RuntimeMetrics:
     evedex_local_mutation_window_seconds: float = -1.0
     evedex_venue_rate_limit_observable: int = -1
     evedex_venue_rate_limit_reserve: int = -1
+    venue_poll_expected_24h: int = 0
+    venue_poll_attempted_24h: int = 0
+    venue_poll_succeeded_24h: int = 0
+    venue_poll_failed_24h: int = 0
+    oldest_inbox_processing_age_seconds: float = -1.0
+    inbox_expired_processing: int = 0
 
 
 RedisProbe = Callable[[str], Awaitable[bool]]
 
 _QUERY = """
-WITH closed_bars AS (
+WITH bounds AS (
+    SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint AS now_ms
+), closed_bars AS (
     SELECT payload->>'symbol' AS symbol,
            (payload->>'open_time_ms')::bigint AS open_time_ms,
            produced_at
@@ -93,6 +101,50 @@ WITH closed_bars AS (
       FROM event_audit
      WHERE topic='kairos.venue.quality.v1'
        AND produced_at >= now() - interval '24 hours'
+), venue_poll_facts AS (
+    SELECT produced_at,
+           payload->>'poll_id' AS poll_id,
+           payload->>'config_fingerprint' AS config_fingerprint,
+           payload->>'status' AS status,
+           (payload->>'interval_ms')::bigint AS interval_ms,
+           (payload->>'scheduled_at_ms')::bigint AS scheduled_at_ms,
+           jsonb_array_length(payload->'expected_symbols')::bigint AS symbol_count
+      FROM event_audit
+     WHERE topic='kairos.venue.poll.v1'
+       AND produced_at >= now() - interval '25 hours'
+       AND payload->>'status' IN ('ATTEMPTED', 'SUCCEEDED', 'FAILED')
+       AND payload->>'interval_ms' ~ '^[1-9][0-9]*$'
+       AND payload->>'scheduled_at_ms' ~ '^[1-9][0-9]*$'
+       AND jsonb_typeof(payload->'expected_symbols')='array'
+), venue_poll_config AS (
+    SELECT config_fingerprint,
+           interval_ms,
+           symbol_count,
+           ceil(86400000.0 / interval_ms)::bigint * symbol_count AS expected_count
+      FROM venue_poll_facts, bounds
+     WHERE status='ATTEMPTED'
+       AND interval_ms > 0
+       AND symbol_count > 0
+       AND scheduled_at_ms BETWEEN bounds.now_ms - 86400000 AND bounds.now_ms
+     ORDER BY scheduled_at_ms DESC, produced_at DESC
+     LIMIT 1
+), venue_poll_attempts AS (
+    SELECT DISTINCT poll_id
+      FROM venue_poll_facts, venue_poll_config, bounds
+     WHERE venue_poll_facts.config_fingerprint=venue_poll_config.config_fingerprint
+       AND venue_poll_facts.status='ATTEMPTED'
+       AND scheduled_at_ms BETWEEN bounds.now_ms - 86400000 AND bounds.now_ms
+), venue_poll_terminal AS (
+    SELECT venue_poll_facts.poll_id, min(venue_poll_facts.status) AS status
+      FROM venue_poll_facts
+      JOIN venue_poll_attempts ON venue_poll_attempts.poll_id=venue_poll_facts.poll_id
+      CROSS JOIN venue_poll_config
+      CROSS JOIN bounds
+     WHERE venue_poll_facts.config_fingerprint=venue_poll_config.config_fingerprint
+       AND venue_poll_facts.status IN ('SUCCEEDED', 'FAILED')
+       AND venue_poll_facts.scheduled_at_ms BETWEEN bounds.now_ms - 86400000 AND bounds.now_ms
+     GROUP BY venue_poll_facts.poll_id
+    HAVING count(DISTINCT venue_poll_facts.status)=1
 ), decisions AS (
     SELECT payload->>'trade_id' AS trade_id,
            payload->'intent'->>'side' AS side,
@@ -130,6 +182,11 @@ SELECT
       WHERE dead_lettered_at IS NOT NULL)::bigint AS outbox_dead_lettered,
     (SELECT count(*) FROM message_inbox WHERE status = 'PROCESSING')::bigint AS inbox_processing,
     (SELECT count(*) FROM message_inbox WHERE status = 'FAILED')::bigint AS inbox_failed,
+    COALESCE((SELECT EXTRACT(EPOCH FROM now() - min(updated_at))
+      FROM message_inbox WHERE status = 'PROCESSING'), -1)::double precision
+      AS oldest_inbox_processing_age_seconds,
+    (SELECT count(*) FROM message_inbox
+      WHERE status = 'PROCESSING' AND lease_until < now())::bigint AS inbox_expired_processing,
     (SELECT count(*) FROM execution_effects WHERE status = 'PREPARED')::bigint AS execution_prepared,
     (SELECT count(*) FROM execution_effects WHERE status = 'FAILED')::bigint AS execution_failed,
     COALESCE((SELECT EXTRACT(EPOCH FROM now() - min(created_at))
@@ -144,8 +201,20 @@ SELECT
     COALESCE((SELECT EXTRACT(EPOCH FROM now() - min(latest_produced_at))
       FROM closed_bar_coverage), 0)::double precision AS latest_closed_bar_age_seconds,
     (SELECT count(*) FROM venue)::bigint AS venue_measurements_24h,
-    least(1.0, (SELECT count(*) FROM venue)::double precision / 14400.0)
-      AS venue_availability_ratio_24h,
+    CASE WHEN COALESCE((SELECT expected_count FROM venue_poll_config), 0) > 0
+      THEN least(
+        1.0,
+        (SELECT count(*) FROM venue_poll_terminal WHERE status='SUCCEEDED')::double precision
+          / (SELECT expected_count FROM venue_poll_config)::double precision
+      )
+      ELSE 0.0 END AS venue_availability_ratio_24h,
+    COALESCE((SELECT expected_count FROM venue_poll_config), 0)::bigint
+      AS venue_poll_expected_24h,
+    (SELECT count(*) FROM venue_poll_attempts)::bigint AS venue_poll_attempted_24h,
+    (SELECT count(*) FROM venue_poll_terminal WHERE status='SUCCEEDED')::bigint
+      AS venue_poll_succeeded_24h,
+    (SELECT count(*) FROM venue_poll_terminal WHERE status='FAILED')::bigint
+      AS venue_poll_failed_24h,
     (SELECT count(*) FROM venue WHERE NOT entry_allowed)::bigint AS venue_blocked_24h,
     COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY abs_basis_bps) FROM venue), 0)
       ::double precision AS venue_p95_abs_basis_bps,
@@ -182,7 +251,11 @@ SELECT
     COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY shortfall_bps) FROM shortfall), 0)
       ::double precision AS execution_p95_shortfall_bps,
     COALESCE((SELECT EXTRACT(EPOCH FROM now() - max(produced_at))
-      FROM event_audit WHERE topic='kairos.account.snapshot.v2'), 0)::double precision
+      FROM event_audit
+      WHERE topic='kairos.account.snapshot.v2'
+        AND payload->>'trading_mode'='PAPER'
+        AND payload->>'evedex_profile'='DEV'
+        AND payload->>'reconciled'='true'), -1)::double precision
       AS latest_paper_account_age_seconds,
     COALESCE((SELECT sum(actual_cost_microusd)::double precision / 1000000
       FROM source_usage_reservations
@@ -304,6 +377,12 @@ async def collect_runtime_metrics(
         evedex_local_mutation_window_seconds=float(row["evedex_local_mutation_window_seconds"]),
         evedex_venue_rate_limit_observable=int(row["evedex_venue_rate_limit_observable"]),
         evedex_venue_rate_limit_reserve=int(row["evedex_venue_rate_limit_reserve"]),
+        venue_poll_expected_24h=int(row["venue_poll_expected_24h"]),
+        venue_poll_attempted_24h=int(row["venue_poll_attempted_24h"]),
+        venue_poll_succeeded_24h=int(row["venue_poll_succeeded_24h"]),
+        venue_poll_failed_24h=int(row["venue_poll_failed_24h"]),
+        oldest_inbox_processing_age_seconds=float(row["oldest_inbox_processing_age_seconds"]),
+        inbox_expired_processing=int(row["inbox_expired_processing"]),
     )
 
 
@@ -339,6 +418,18 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
         ),
         ("kairos_inbox_processing", "Inbox rows currently processing.", "gauge", metrics.inbox_processing),
         ("kairos_inbox_failed", "Inbox rows in failed state.", "gauge", metrics.inbox_failed),
+        (
+            "kairos_inbox_processing_oldest_age_seconds",
+            "Age of the oldest current inbox processing attempt; -1 means none.",
+            "gauge",
+            metrics.oldest_inbox_processing_age_seconds,
+        ),
+        (
+            "kairos_inbox_processing_expired",
+            "Inbox processing rows whose recovery lease has expired.",
+            "gauge",
+            metrics.inbox_expired_processing,
+        ),
         (
             "kairos_execution_effects_prepared",
             "Execution effects awaiting confirmation or reconciliation.",
@@ -389,9 +480,33 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
         ),
         (
             "kairos_venue_availability_ratio_24h",
-            "Fraction of the expected five-symbol 30-second EVEDEX measurements over 24 hours.",
+            "Successful durable public venue polls divided by configured slots over 24 hours.",
             "gauge",
             metrics.venue_availability_ratio_24h,
+        ),
+        (
+            "kairos_venue_poll_expected_24h",
+            "Expected per-symbol public venue poll slots for the latest 24-hour configuration.",
+            "gauge",
+            metrics.venue_poll_expected_24h,
+        ),
+        (
+            "kairos_venue_poll_attempted_24h",
+            "Distinct durable public venue poll attempts for the latest configuration over 24 hours.",
+            "gauge",
+            metrics.venue_poll_attempted_24h,
+        ),
+        (
+            "kairos_venue_poll_succeeded_24h",
+            "Distinct successful public venue poll outcomes over 24 hours.",
+            "gauge",
+            metrics.venue_poll_succeeded_24h,
+        ),
+        (
+            "kairos_venue_poll_failed_24h",
+            "Distinct failed public venue poll outcomes over 24 hours.",
+            "gauge",
+            metrics.venue_poll_failed_24h,
         ),
         (
             "kairos_venue_blocked_24h",
@@ -479,7 +594,7 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
         ),
         (
             "kairos_paper_account_latest_age_seconds",
-            "Age of the latest persisted strict PAPER account snapshot.",
+            "Age of the latest reconciled EVEDEX DEV PAPER account snapshot; -1 is absent.",
             "gauge",
             metrics.latest_paper_account_age_seconds,
         ),

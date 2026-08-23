@@ -165,3 +165,12 @@ pending/dead-lettered outbox rows, processing/failed inbox rows, unresolved/fail
 execution effects, and the oldest unpublished message age. The exporter performs
 read-only queries and an authenticated Redis `PING`; database or Redis failure is
 returned as a zero health gauge rather than fabricated healthy metrics.
+
+Venue availability is derived from strict `kairos.venue.poll.v1` attempt and
+terminal-outcome facts. The denominator is the full 24-hour slot count for the
+latest interval and symbol-set fingerprint; missing polls, failed reads, process
+downtime and an incomplete post-configuration window therefore reduce the ratio.
+Separate expected, attempted, succeeded and failed gauges make the result auditable.
+The PAPER account age includes only reconciled `PAPER`/`DEV` snapshots and is `-1`
+when no such snapshot exists. Inbox monitoring likewise exports the oldest current
+processing-attempt age and the number of rows whose recovery lease has expired.
