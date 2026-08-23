@@ -10,14 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import asyncpg
-from kairos_core.contracts import RiskTradeDecisionV1
+from kairos_core.contracts import RiskTradeDecisionV1, TradeExecutionEventV1
 from kairos_core.enums import (
     EvedexProfile,
     OrderSide,
@@ -31,10 +31,11 @@ from kairos_core.enums import (
     TradeLifecycleState as TradeState,
 )
 
-from .repository import MessageIdentityConflict
+from .repository import AuditRepository, MessageIdentityConflict
 from .runtime import canonical_payload
 
 TERMINAL_TRADE_STATES = frozenset({TradeState.FLAT, TradeState.CANCELLED})
+TRADE_EXECUTION_EVENT_TOPIC = "kairos.execution.trade_event.v1"
 
 _ALLOWED_TRANSITIONS: dict[TradeState, frozenset[TradeState]] = {
     TradeState.RECEIVED: frozenset(
@@ -556,6 +557,18 @@ class TradeLifecycleRepository:
             finally:
                 await connection.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock_identity)
 
+    @asynccontextmanager
+    async def account_lock(self, *, environment: str, account_id: str, exchange: str) -> AsyncIterator[None]:
+        """Cross-process account lock for recovery, snapshots and canary admission."""
+        self._validate_scope(environment, account_id, exchange)
+        async with self.pool.acquire() as connection:
+            identity = f"kairos.execution-account:{environment}:{account_id}:{exchange}"
+            await connection.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", identity)
+            try:
+                yield
+            finally:
+                await connection.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", identity)
+
     async def begin_recovery(self, *, environment: str, account_id: str, exchange: str) -> RecoveryState:
         self._validate_scope(environment, account_id, exchange)
         row = await self.pool.fetchrow(
@@ -621,7 +634,7 @@ class TradeLifecycleRepository:
         return state is not None and not state.entries_blocked
 
     async def next_event_sequence(self, trade_id: str) -> int:
-        """Reserve one monotonic public execution-event sequence for a trade."""
+        """Legacy sequence reservation; use append_execution_event for crash safety."""
         self._validate_text("trade_id", trade_id)
         value = await self.pool.fetchval(
             """UPDATE execution_trades
@@ -632,6 +645,173 @@ class TradeLifecycleRepository:
         if value is None:
             raise KeyError(f"unknown trade {trade_id!r}")
         return int(value)
+
+    async def append_execution_event(
+        self,
+        trade_id: str,
+        *,
+        fact_key: str,
+        expected_state_version: int,
+        build: Callable[[int], TradeExecutionEventV1],
+    ) -> TradeExecutionEventV1:
+        """Atomically persist a strict public fact and enqueue its durable outbox row.
+
+        ``fact_key`` identifies the lifecycle fact independently of sequence and
+        wall-clock time. Replays must rebuild the exact same canonical event.
+        """
+
+        self._validate_text("trade_id", trade_id)
+        if not fact_key or fact_key != fact_key.strip() or len(fact_key) > 512:
+            raise ValueError("fact_key must be normalized and at most 512 characters")
+        if (
+            isinstance(expected_state_version, bool)
+            or not isinstance(expected_state_version, int)
+            or expected_state_version < 0
+        ):
+            raise ValueError("expected_state_version must be a non-negative integer")
+        if not callable(build):
+            raise TypeError("build must be callable")
+
+        audit = AuditRepository(self.pool)
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await self._xact_lock(connection, trade_id)
+                trade_row = await connection.fetchrow(
+                    "SELECT * FROM execution_trades WHERE trade_id=$1 FOR UPDATE",
+                    trade_id,
+                )
+                if trade_row is None:
+                    raise KeyError(f"unknown trade {trade_id!r}")
+                trade = self._record(trade_row)
+                existing = await connection.fetchrow(
+                    """SELECT event_seq,state_version,event_id,payload,payload_sha256
+                         FROM public_execution_events
+                        WHERE trade_id=$1 AND fact_key=$2""",
+                    trade_id,
+                    fact_key,
+                )
+                if existing is not None:
+                    if int(existing["state_version"]) != expected_state_version:
+                        raise MessageIdentityConflict(
+                            "execution fact was replayed against a different trade state version"
+                        )
+                    event = self._execution_event(existing["payload"], existing["payload_sha256"])
+                    self._validate_execution_event(event, trade, require_current_state=False)
+                    rebuilt = build(int(existing["event_seq"]))
+                    if rebuilt.event_seq != int(existing["event_seq"]):
+                        raise ValueError("public execution event builder returned the wrong sequence")
+                    self._validate_execution_event(rebuilt, trade, require_current_state=False)
+                    if canonical_payload(rebuilt.model_dump(mode="json"))[1] != existing["payload_sha256"]:
+                        raise MessageIdentityConflict(
+                            f"execution fact_key {fact_key!r} was reused with different content"
+                        )
+                    await audit.append_event(
+                        TRADE_EXECUTION_EVENT_TOPIC,
+                        event,
+                        connection=connection,
+                    )
+                    encoded, fingerprint = canonical_payload(event.model_dump(mode="json"))
+                    await audit.enqueue_outbox(
+                        connection,
+                        event.message_id,
+                        TRADE_EXECUTION_EVENT_TOPIC,
+                        encoded,
+                        fingerprint,
+                    )
+                    return event
+
+                if trade.state_version != expected_state_version:
+                    raise RuntimeError("trade state changed before its public execution fact was appended")
+                sequence = int(trade_row["next_execution_event_seq"])
+                event = build(sequence)
+                if event.event_seq != sequence:
+                    raise ValueError("public execution event builder returned the wrong sequence")
+                self._validate_execution_event(event, trade, require_current_state=True)
+                encoded, fingerprint = canonical_payload(event.model_dump(mode="json"))
+                result = await connection.execute(
+                    """INSERT INTO public_execution_events
+                       (trade_id,fact_key,event_seq,state_version,event_id,payload,payload_sha256)
+                       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)""",
+                    trade_id,
+                    fact_key,
+                    sequence,
+                    expected_state_version,
+                    event.event_id,
+                    encoded,
+                    fingerprint,
+                )
+                if not result.endswith(" 1"):
+                    raise RuntimeError("public execution event insert did not affect one row")
+                advanced = await connection.execute(
+                    """UPDATE execution_trades
+                          SET next_execution_event_seq=next_execution_event_seq+1, updated_at=now()
+                        WHERE trade_id=$1 AND next_execution_event_seq=$2""",
+                    trade_id,
+                    sequence,
+                )
+                if not advanced.endswith(" 1"):
+                    raise RuntimeError("public execution event sequence was not advanced")
+                await audit.append_event(
+                    TRADE_EXECUTION_EVENT_TOPIC,
+                    event,
+                    connection=connection,
+                )
+                await audit.enqueue_outbox(
+                    connection,
+                    event.message_id,
+                    TRADE_EXECUTION_EVENT_TOPIC,
+                    encoded,
+                    fingerprint,
+                )
+                return event
+
+    async def list_execution_events(self, trade_id: str) -> list[TradeExecutionEventV1]:
+        self._validate_text("trade_id", trade_id)
+        rows = await self.pool.fetch(
+            """SELECT payload,payload_sha256 FROM public_execution_events
+                WHERE trade_id=$1 ORDER BY event_seq""",
+            trade_id,
+        )
+        return [self._execution_event(row["payload"], row["payload_sha256"]) for row in rows]
+
+    async def get_execution_event(self, trade_id: str, *, fact_key: str) -> TradeExecutionEventV1 | None:
+        """Return the first durable fact so replay need not rebuild mutable telemetry."""
+        self._validate_text("trade_id", trade_id)
+        if not fact_key or fact_key != fact_key.strip() or len(fact_key) > 512:
+            raise ValueError("fact_key must be normalized and at most 512 characters")
+        row = await self.pool.fetchrow(
+            """SELECT payload,payload_sha256 FROM public_execution_events
+                WHERE trade_id=$1 AND fact_key=$2""",
+            trade_id,
+            fact_key,
+        )
+        return None if row is None else self._execution_event(row["payload"], row["payload_sha256"])
+
+    async def list_execution_events_for_scope(
+        self,
+        *,
+        environment: str,
+        account_id: str,
+        exchange: str,
+        since: datetime | None = None,
+    ) -> list[TradeExecutionEventV1]:
+        """List public facts for every scoped trade, including terminal trades."""
+        self._validate_scope(environment, account_id, exchange)
+        if since is not None and (since.tzinfo is None or since.utcoffset() is None):
+            raise ValueError("since must be timezone-aware")
+        rows = await self.pool.fetch(
+            """SELECT events.payload,events.payload_sha256
+                 FROM public_execution_events AS events
+                 JOIN execution_trades AS trades USING (trade_id)
+                WHERE trades.environment=$1 AND trades.account_id=$2 AND trades.exchange=$3
+                  AND ($4::timestamptz IS NULL OR events.created_at >= $4)
+                ORDER BY events.created_at, events.trade_id, events.event_seq""",
+            environment,
+            account_id,
+            exchange,
+            None if since is None else since.astimezone(UTC),
+        )
+        return [self._execution_event(row["payload"], row["payload_sha256"]) for row in rows]
 
     async def record_equity(
         self,
@@ -720,6 +900,41 @@ class TradeLifecycleRepository:
         if current is not None and supplied is not None and current != supplied:
             raise MessageIdentityConflict(f"{name} is immutable once recorded")
         return current or supplied
+
+    @staticmethod
+    def _execution_event(payload: Any, expected_sha256: str) -> TradeExecutionEventV1:
+        data = TradeLifecycleRepository._object(payload)
+        if canonical_payload(data)[1] != expected_sha256:
+            raise MessageIdentityConflict("stored public execution event fingerprint does not match")
+        return TradeExecutionEventV1.model_validate(data)
+
+    @staticmethod
+    def _validate_execution_event(
+        event: TradeExecutionEventV1,
+        trade: TradeRecord,
+        *,
+        require_current_state: bool,
+    ) -> None:
+        if event.message_id != event.event_id:
+            raise ValueError("public execution event message_id must equal its event_id")
+        expected = {
+            "trade_id": (event.trade_id, trade.trade_id),
+            "intent_id": (event.intent_id, trade.strategy_intent_id),
+            "risk_decision_id": (event.risk_decision_id, trade.risk_decision_id),
+            "strategy_id": (event.strategy_id, trade.strategy_id),
+            "strategy_revision": (event.strategy_revision, trade.strategy_revision),
+            "account_id": (event.account_id, trade.account_id),
+            "venue_symbol": (event.venue_symbol, trade.venue_symbol),
+            "trading_mode": (event.trading_mode.value, trade.trading_mode),
+            "profile": (event.evedex_profile.value, trade.profile),
+        }
+        if require_current_state:
+            expected["lifecycle_state"] = (event.lifecycle_state.value, trade.state.value)
+        mismatches = [name for name, (actual, wanted) in expected.items() if actual != wanted]
+        if mismatches:
+            raise MessageIdentityConflict(
+                "public execution event differs from durable trade lineage: " + ", ".join(sorted(mismatches))
+            )
 
     @staticmethod
     def _validate_text(name: str, value: str) -> None:

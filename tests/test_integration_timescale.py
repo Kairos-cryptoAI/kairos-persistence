@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import asyncpg
@@ -17,6 +17,8 @@ from kairos_persistence import (
     EffectStatus,
     EffectType,
     ExecutionJournalRepository,
+    ExecutionRuntimeHealth,
+    ExecutionRuntimeHealthRepository,
     MessageIdentityConflict,
     PersistenceSettings,
     SourceBudgetExceeded,
@@ -60,7 +62,62 @@ async def test_operations_query_covers_strict_paper_audit_and_lifecycle_tables()
         assert metrics.paper_unprotected_trades >= 0
         assert metrics.execution_p95_shortfall_bps >= 0
         assert metrics.api_spend_month_usd >= 0
+        assert metrics.execution_runtime_health_age_seconds >= -1
+        assert metrics.evedex_local_mutation_reserve >= -1
     finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_execution_runtime_health_is_durable_and_exported_without_secrets() -> None:
+    database = Database(_settings())
+    await database.connect()
+    account_id = f"remote-dev-{uuid4().hex}"
+    try:
+        await database.migrate()
+        repository = ExecutionRuntimeHealthRepository(database.pool)
+        health = ExecutionRuntimeHealth(
+            environment="evedex-dev",
+            account_id=account_id,
+            exchange="evedex",
+            observed_at=datetime.now(UTC),
+            auth_age_ms=10_000,
+            auth_expires_in_ms=300_000,
+            local_mutation_reserve=28,
+            local_mutation_capacity=30,
+            local_mutation_compensation_reserve=4,
+            local_mutation_window_ms=60_000,
+            venue_rate_limit_observable=False,
+            venue_rate_limit_reserve=None,
+        )
+        assert await repository.record(health)
+        assert (
+            await repository.latest(
+                environment="evedex-dev",
+                account_id=account_id,
+                exchange="evedex",
+            )
+            == health
+        )
+
+        async def redis_probe(_url: str) -> bool:
+            return True
+
+        metrics = await collect_runtime_metrics(
+            database.pool,
+            redis_url="redis://unused",
+            redis_probe=redis_probe,
+        )
+        assert metrics.execution_runtime_health_age_seconds >= 0
+        assert metrics.evedex_auth_age_seconds >= 10
+        assert metrics.evedex_auth_expires_in_seconds <= 300
+        assert metrics.evedex_local_mutation_reserve == 28
+        assert metrics.evedex_local_mutation_capacity == 30
+        assert metrics.evedex_local_mutation_compensation_reserve == 4
+        assert metrics.evedex_venue_rate_limit_observable == 0
+        assert metrics.evedex_venue_rate_limit_reserve == -1
+    finally:
+        await database.pool.execute("DELETE FROM execution_runtime_health WHERE account_id=$1", account_id)
         await database.close()
 
 

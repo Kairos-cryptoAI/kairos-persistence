@@ -20,6 +20,8 @@ from kairos_core import (
     Side,
     StrategyIntentV1,
     StrategyProvenanceV1,
+    TradeExecutionEventType,
+    TradeExecutionEventV1,
     TradeLifecycleState,
     TradingMode,
     VenueQualityV1,
@@ -213,6 +215,171 @@ def test_migration_enforces_one_active_trade_and_restart_barrier() -> None:
     assert "TIMEOUT_CLOSE" in migration
     assert "venue_symbol ~ '^[A-Z0-9]+:DEV$'" in migration
     assert "WHERE state NOT IN ('FLAT', 'CANCELLED');" in migration
+
+    public_migration = (
+        Path(__file__).parents[1] / "kairos_persistence" / "migrations" / "008_public_execution_events.sql"
+    ).read_text(encoding="utf-8")
+    assert "public_execution_events" in public_migration
+    assert "UNIQUE (trade_id, event_seq)" in public_migration
+    assert "payload_sha256" in public_migration
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_public_execution_fact_and_outbox_are_atomic_replay_safe_and_scoped() -> None:
+    database_url = os.getenv("KAIROS_PERSISTENCE_DATABASE_URL")
+    if not database_url:
+        pytest.skip("KAIROS_PERSISTENCE_DATABASE_URL is required for integration tests")
+    database = Database(PersistenceSettings(database_url=database_url))
+    await database.connect()
+    await database.migrate()
+    repository = TradeLifecycleRepository(database.pool)
+    trade_input = _trade()
+    decision = RiskTradeDecisionV1.model_validate(trade_input.risk_decision_payload)
+    trade_id = trade_input.trade_id
+    event_ids: list[str] = []
+
+    def received(sequence: int, *, occurred_at_ms: int = T0 + 60_400) -> TradeExecutionEventV1:
+        return TradeExecutionEventV1(
+            source="execution-engine",
+            event_seq=sequence,
+            occurred_at_ms=occurred_at_ms,
+            event_type=TradeExecutionEventType.DECISION_RECEIVED,
+            lifecycle_state=TradeLifecycleState.RECEIVED,
+            trading_mode=TradingMode.PAPER,
+            evedex_profile=EvedexProfile.DEV,
+            account_id=trade_input.account_id,
+            venue_symbol=trade_input.venue_symbol,
+            strategy_id=trade_input.strategy_id,
+            strategy_revision=trade_input.strategy_revision,
+            intent_id=trade_input.strategy_intent_id,
+            risk_decision_id=trade_input.risk_decision_id,
+            trade_id=trade_id,
+        )
+
+    try:
+        await database.pool.execute("DELETE FROM public_execution_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trade_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trades WHERE trade_id=$1", trade_id)
+        trade = await repository.create(trade_input)
+        first = await repository.append_execution_event(
+            trade_id,
+            fact_key="decision-received",
+            expected_state_version=trade.state_version,
+            build=received,
+        )
+        assert first.event_seq == 1
+        assert first.event_id is not None
+        event_ids.append(first.event_id)
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM message_outbox WHERE message_id=$1", first.event_id
+            )
+            == 1
+        )
+
+        pending = await repository.transition(
+            trade_id,
+            TradeState.ENTRY_PENDING,
+            event_type="ENTRY_EFFECT_READY",
+        )
+        assert (
+            await repository.append_execution_event(
+                trade_id,
+                fact_key="decision-received",
+                expected_state_version=0,
+                build=received,
+            )
+            == first
+        )
+        with pytest.raises(MessageIdentityConflict, match="different content"):
+            await repository.append_execution_event(
+                trade_id,
+                fact_key="decision-received",
+                expected_state_version=0,
+                build=lambda sequence: received(sequence, occurred_at_ms=T0 + 60_401),
+            )
+
+        def prepared(sequence: int) -> TradeExecutionEventV1:
+            return TradeExecutionEventV1(
+                source="execution-engine",
+                event_seq=sequence,
+                occurred_at_ms=T0 + 60_500,
+                event_type=TradeExecutionEventType.EFFECT_PREPARED,
+                lifecycle_state=TradeLifecycleState.ENTRY_PENDING,
+                trading_mode=TradingMode.PAPER,
+                evedex_profile=EvedexProfile.DEV,
+                account_id=trade_input.account_id,
+                venue_symbol=trade_input.venue_symbol,
+                strategy_id=trade_input.strategy_id,
+                strategy_revision=trade_input.strategy_revision,
+                intent_id=trade_input.strategy_intent_id,
+                risk_decision_id=trade_input.risk_decision_id,
+                trade_id=trade_id,
+                effect_id=f"entry-place:{trade_id}",
+                order_role="ENTRY",
+                client_order_id=trade_input.entry_client_order_id,
+                requested_quantity=decision.quantity,
+            )
+
+        second = await repository.append_execution_event(
+            trade_id,
+            fact_key="entry-effect-prepared",
+            expected_state_version=pending.state_version,
+            build=prepared,
+        )
+        assert second.event_seq == 2
+        assert second.event_id is not None
+        event_ids.append(second.event_id)
+        events = await repository.list_execution_events(trade_id)
+        assert [event.event_seq for event in events] == [1, 2]
+        scoped = await repository.list_execution_events_for_scope(
+            environment=trade_input.environment,
+            account_id=trade_input.account_id,
+            exchange=trade_input.exchange,
+        )
+        assert [event.event_id for event in scoped] == [first.event_id, second.event_id]
+
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def first_holder() -> None:
+            async with repository.account_lock(
+                environment="evedex-dev",
+                account_id="remote-dev-account",
+                exchange="evedex",
+            ):
+                first_entered.set()
+                await release_first.wait()
+
+        async def second_holder() -> None:
+            await first_entered.wait()
+            async with repository.account_lock(
+                environment="evedex-dev",
+                account_id="remote-dev-account",
+                exchange="evedex",
+            ):
+                second_entered.set()
+
+        first_task = asyncio.create_task(first_holder())
+        second_task = asyncio.create_task(second_holder())
+        await first_entered.wait()
+        await asyncio.sleep(0.05)
+        assert not second_entered.is_set()
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+        assert second_entered.is_set()
+    finally:
+        if event_ids:
+            await database.pool.execute(
+                "DELETE FROM message_outbox WHERE message_id=ANY($1::text[])", event_ids
+            )
+            await database.pool.execute("DELETE FROM event_audit WHERE message_id=ANY($1::text[])", event_ids)
+        await database.pool.execute("DELETE FROM public_execution_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trade_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trades WHERE trade_id=$1", trade_id)
+        await database.close()
 
 
 @pytest.mark.integration

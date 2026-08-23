@@ -70,6 +70,15 @@ async def test_collects_database_and_authenticated_redis_health():
         "execution_p95_shortfall_bps": 2.5,
         "latest_paper_account_age_seconds": 8.0,
         "api_spend_month_usd": 0.75,
+        "execution_runtime_health_age_seconds": 4.0,
+        "evedex_auth_age_seconds": 14.0,
+        "evedex_auth_expires_in_seconds": 286.0,
+        "evedex_local_mutation_reserve": 27,
+        "evedex_local_mutation_capacity": 30,
+        "evedex_local_mutation_compensation_reserve": 4,
+        "evedex_local_mutation_window_seconds": 60.0,
+        "evedex_venue_rate_limit_observable": 0,
+        "evedex_venue_rate_limit_reserve": -1,
     }
 
     async def redis_probe(url):
@@ -114,6 +123,15 @@ async def test_collects_database_and_authenticated_redis_health():
         2.5,
         8.0,
         0.75,
+        4.0,
+        14.0,
+        286.0,
+        27,
+        30,
+        4,
+        60.0,
+        0,
+        -1,
     )
     rendered = render_prometheus(metrics).decode()
     assert "kairos_outbox_pending 2" in rendered
@@ -125,6 +143,10 @@ async def test_collects_database_and_authenticated_redis_health():
     assert "kairos_venue_max_book_age_ms 1500" in rendered
     assert "kairos_paper_unprotected_trades 0" in rendered
     assert "kairos_api_spend_month_usd 0.75" in rendered
+    assert "kairos_evedex_auth_age_seconds 14.0" in rendered
+    assert "kairos_evedex_local_mutation_reserve 27" in rendered
+    assert "kairos_evedex_local_mutation_compensation_reserve 4" in rendered
+    assert "kairos_evedex_venue_rate_limit_reserve -1" in rendered
 
 
 @pytest.mark.asyncio

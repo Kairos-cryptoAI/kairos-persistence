@@ -47,6 +47,15 @@ class RuntimeMetrics:
     execution_p95_shortfall_bps: float = 0.0
     latest_paper_account_age_seconds: float = 0.0
     api_spend_month_usd: float = 0.0
+    execution_runtime_health_age_seconds: float = -1.0
+    evedex_auth_age_seconds: float = -1.0
+    evedex_auth_expires_in_seconds: float = -1.0
+    evedex_local_mutation_reserve: int = -1
+    evedex_local_mutation_capacity: int = -1
+    evedex_local_mutation_compensation_reserve: int = -1
+    evedex_local_mutation_window_seconds: float = -1.0
+    evedex_venue_rate_limit_observable: int = -1
+    evedex_venue_rate_limit_reserve: int = -1
 
 
 RedisProbe = Callable[[str], Awaitable[bool]]
@@ -107,6 +116,12 @@ WITH closed_bars AS (
       FROM entry_fills
       JOIN decisions USING (trade_id)
      WHERE decisions.decision_entry_price > 0
+), runtime_health AS (
+    SELECT *, EXTRACT(EPOCH FROM now() - observed_at)::double precision AS observation_age_seconds
+      FROM execution_runtime_health
+     WHERE environment='evedex-dev' AND lower(exchange)='evedex'
+     ORDER BY observed_at DESC
+     LIMIT 1
 )
 SELECT
     (SELECT count(*) FROM message_outbox
@@ -173,7 +188,26 @@ SELECT
       FROM source_usage_reservations
       WHERE status='COMMITTED'
         AND billing_month=date_trunc('month', CURRENT_DATE)::date), 0)::double precision
-      AS api_spend_month_usd
+      AS api_spend_month_usd,
+    COALESCE((SELECT observation_age_seconds FROM runtime_health), -1)
+      ::double precision AS execution_runtime_health_age_seconds,
+    COALESCE((SELECT auth_age_ms::double precision / 1000 + observation_age_seconds
+      FROM runtime_health), -1)::double precision AS evedex_auth_age_seconds,
+    COALESCE((SELECT CASE WHEN auth_expires_in_ms IS NULL THEN -1
+      ELSE greatest(0, auth_expires_in_ms::double precision / 1000 - observation_age_seconds)
+      END FROM runtime_health), -1)::double precision AS evedex_auth_expires_in_seconds,
+    COALESCE((SELECT local_mutation_reserve FROM runtime_health), -1)::bigint
+      AS evedex_local_mutation_reserve,
+    COALESCE((SELECT local_mutation_capacity FROM runtime_health), -1)::bigint
+      AS evedex_local_mutation_capacity,
+    COALESCE((SELECT local_mutation_compensation_reserve FROM runtime_health), -1)::bigint
+      AS evedex_local_mutation_compensation_reserve,
+    COALESCE((SELECT local_mutation_window_ms::double precision / 1000
+      FROM runtime_health), -1)::double precision AS evedex_local_mutation_window_seconds,
+    COALESCE((SELECT venue_rate_limit_observable::int FROM runtime_health), -1)::bigint
+      AS evedex_venue_rate_limit_observable,
+    COALESCE((SELECT venue_rate_limit_reserve FROM runtime_health), -1)::bigint
+      AS evedex_venue_rate_limit_reserve
 """
 
 
@@ -261,6 +295,15 @@ async def collect_runtime_metrics(
         execution_p95_shortfall_bps=float(row["execution_p95_shortfall_bps"]),
         latest_paper_account_age_seconds=float(row["latest_paper_account_age_seconds"]),
         api_spend_month_usd=float(row["api_spend_month_usd"]),
+        execution_runtime_health_age_seconds=float(row["execution_runtime_health_age_seconds"]),
+        evedex_auth_age_seconds=float(row["evedex_auth_age_seconds"]),
+        evedex_auth_expires_in_seconds=float(row["evedex_auth_expires_in_seconds"]),
+        evedex_local_mutation_reserve=int(row["evedex_local_mutation_reserve"]),
+        evedex_local_mutation_capacity=int(row["evedex_local_mutation_capacity"]),
+        evedex_local_mutation_compensation_reserve=int(row["evedex_local_mutation_compensation_reserve"]),
+        evedex_local_mutation_window_seconds=float(row["evedex_local_mutation_window_seconds"]),
+        evedex_venue_rate_limit_observable=int(row["evedex_venue_rate_limit_observable"]),
+        evedex_venue_rate_limit_reserve=int(row["evedex_venue_rate_limit_reserve"]),
     )
 
 
@@ -445,6 +488,60 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
             "Committed durable provider spend for the current billing month in USD.",
             "gauge",
             metrics.api_spend_month_usd,
+        ),
+        (
+            "kairos_execution_runtime_health_age_seconds",
+            "Age of the latest durable EVEDEX execution runtime health snapshot; -1 is unknown.",
+            "gauge",
+            metrics.execution_runtime_health_age_seconds,
+        ),
+        (
+            "kairos_evedex_auth_age_seconds",
+            "Current age of the active EVEDEX authentication session; -1 is unknown.",
+            "gauge",
+            metrics.evedex_auth_age_seconds,
+        ),
+        (
+            "kairos_evedex_auth_expires_in_seconds",
+            "Estimated seconds until EVEDEX authentication expiry; -1 is unknown.",
+            "gauge",
+            metrics.evedex_auth_expires_in_seconds,
+        ),
+        (
+            "kairos_evedex_local_mutation_reserve",
+            "Remaining locally enforced EVEDEX mutation calls in the current window; -1 is unknown.",
+            "gauge",
+            metrics.evedex_local_mutation_reserve,
+        ),
+        (
+            "kairos_evedex_local_mutation_capacity",
+            "Configured local EVEDEX mutation capacity per window; -1 is unknown.",
+            "gauge",
+            metrics.evedex_local_mutation_capacity,
+        ),
+        (
+            "kairos_evedex_local_mutation_compensation_reserve",
+            "EVEDEX mutation calls reserved for cancel/close compensation; -1 is unknown.",
+            "gauge",
+            metrics.evedex_local_mutation_compensation_reserve,
+        ),
+        (
+            "kairos_evedex_local_mutation_window_seconds",
+            "Local EVEDEX mutation rate-limit window in seconds; -1 is unknown.",
+            "gauge",
+            metrics.evedex_local_mutation_window_seconds,
+        ),
+        (
+            "kairos_evedex_venue_rate_limit_observable",
+            "Whether EVEDEX reported a venue-side rate-limit reserve; -1 is unknown.",
+            "gauge",
+            metrics.evedex_venue_rate_limit_observable,
+        ),
+        (
+            "kairos_evedex_venue_rate_limit_reserve",
+            "Venue-reported EVEDEX request reserve; -1 is unknown or unavailable.",
+            "gauge",
+            metrics.evedex_venue_rate_limit_reserve,
         ),
     )
 
