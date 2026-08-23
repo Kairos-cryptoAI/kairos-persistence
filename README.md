@@ -147,6 +147,15 @@ same epoch may unblock entries. This prevents an older process that finishes lat
 from clearing the barrier established by a newer restart. Day-start, peak and
 latest equity are updated atomically with a monotonic reconciliation sequence.
 
+Execution runtimes use `create_with_execution_event()` and
+`transition_with_execution_event()`. Each call commits the trade row, internal
+hash-chained journal, strict `TradeExecutionEventV1`, audit row and durable
+outbox row in one PostgreSQL transaction. Replaying the same `fact_key` verifies
+the original transition request and canonical event, returns the current trade,
+and never advances the FSM twice. Startup fact audits use
+`list_trades_for_scope(include_terminal=True)` so `FLAT` and `CANCELLED` trades
+cannot hide a missing public lifecycle fact.
+
 ## Runtime metrics
 
 `kairos-persistence-exporter` exposes a small Prometheus endpoint without a

@@ -275,6 +275,14 @@ class EquityState:
     reconciliation_seq: int
 
 
+@dataclass(frozen=True, slots=True)
+class TradeMutationResult:
+    """One durable lifecycle mutation and its externally visible fact."""
+
+    trade: TradeRecord
+    event: TradeExecutionEventV1
+
+
 class TradeLifecycleRepository:
     """Serialize trade exits and make restart recovery an explicit gate."""
 
@@ -282,71 +290,52 @@ class TradeLifecycleRepository:
         self.pool = pool
 
     async def create(self, trade: NewTrade) -> TradeRecord:
+        """Create a trade and its internal lifecycle journal entry.
+
+        Runtime execution paths that publish a ``TradeExecutionEventV1`` must
+        use :meth:`create_with_execution_event` so the trade and public fact
+        cannot be separated by a process crash.
+        """
+
         trade.validate()
-        immutable = self._new_trade_payload(trade)
-        event = {"trade": immutable}
-        event_sha = self._event_sha(trade.trade_id, None, TradeState.RECEIVED, "CREATED", event, None)
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 await self._xact_lock(connection, trade.trade_id)
-                existing = await connection.fetchrow(
-                    "SELECT * FROM execution_trades WHERE trade_id=$1 FOR UPDATE", trade.trade_id
-                )
-                if existing is not None:
-                    record = self._record(existing)
-                    if self._immutable_record_payload(record) != immutable:
-                        raise MessageIdentityConflict(
-                            f"trade_id {trade.trade_id!r} was reused with different immutable content"
-                        )
-                    return record
-                row = await connection.fetchrow(
-                    """INSERT INTO execution_trades
-                       (trade_id, strategy_intent_id, risk_decision_id,
-                        risk_decision_sha256, risk_decision_payload, strategy_id, strategy_revision,
-                        trading_mode, environment, profile, exchange, account_id, symbol, venue_symbol, side,
-                        quantity, leverage, stop_price, target_price, entry_eligible_at, entry_expires_at,
-                        max_holding_ms, state, entry_client_order_id, journal_head_sha256)
-                       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                               $18,$19,$20,$21,$22,'RECEIVED',$23,$24)
-                       RETURNING *""",
-                    trade.trade_id,
-                    trade.strategy_intent_id,
-                    trade.risk_decision_id,
-                    canonical_payload(trade.risk_decision_payload)[1],
-                    self._json(trade.risk_decision_payload),
-                    trade.strategy_id,
-                    trade.strategy_revision,
-                    trade.trading_mode,
-                    trade.environment,
-                    trade.profile,
-                    trade.exchange,
-                    trade.account_id,
-                    trade.symbol,
-                    trade.venue_symbol,
-                    trade.side,
-                    trade.quantity,
-                    trade.leverage,
-                    trade.stop_price,
-                    trade.target_price,
-                    trade.entry_eligible_at.astimezone(UTC),
-                    trade.entry_expires_at.astimezone(UTC),
-                    trade.max_holding_ms,
-                    trade.entry_client_order_id,
-                    event_sha,
-                )
-                await self._append_event(
+                return await self._create_locked(connection, trade)
+
+    async def create_with_execution_event(
+        self,
+        trade: NewTrade,
+        *,
+        fact_key: str,
+        build: Callable[[int], TradeExecutionEventV1],
+    ) -> TradeMutationResult:
+        """Atomically create a trade, public fact, audit row and outbox row.
+
+        A replay of the same ``fact_key`` validates both immutable trade
+        lineage and the canonical rebuilt fact, then returns the current trade
+        without recreating it. This remains safe after later state advances.
+        """
+
+        trade.validate()
+        self._validate_fact_arguments(fact_key=fact_key, build=build)
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await self._xact_lock(connection, trade.trade_id)
+                record = await self._create_locked(connection, trade)
+                existing = await self._execution_fact_row(connection, trade.trade_id, fact_key)
+                if existing is None and record.state_version != 0:
+                    raise RuntimeError(
+                        "trade creation fact is missing after the lifecycle has already advanced"
+                    )
+                event = await self._append_execution_event_locked(
                     connection,
-                    trade.trade_id,
-                    None,
-                    TradeState.RECEIVED,
-                    "CREATED",
-                    event,
-                    None,
-                    event_sha,
+                    record,
+                    fact_key=fact_key,
+                    expected_state_version=0,
+                    build=build,
                 )
-        if row is None:
-            raise RuntimeError("trade lifecycle create returned no row")
-        return self._record(row)
+                return TradeMutationResult(trade=record, event=event)
 
     async def get(self, trade_id: str) -> TradeRecord | None:
         row = await self.pool.fetchrow("SELECT * FROM execution_trades WHERE trade_id=$1", trade_id)
@@ -369,8 +358,66 @@ class TradeLifecycleRepository:
         close_client_order_id: str | None = None,
         close_exchange_order_id: str | None = None,
     ) -> TradeRecord:
-        if not trade_id.strip() or not event_type.strip():
-            raise ValueError("trade_id and event_type must not be empty")
+        """Advance only the internal lifecycle journal.
+
+        Runtime execution paths that emit a public fact must use
+        :meth:`transition_with_execution_event`.
+        """
+
+        self._validate_transition_arguments(trade_id=trade_id, event_type=event_type)
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await self._xact_lock(connection, trade_id)
+                row = await connection.fetchrow(
+                    "SELECT * FROM execution_trades WHERE trade_id=$1 FOR UPDATE", trade_id
+                )
+                if row is None:
+                    raise KeyError(f"unknown trade {trade_id!r}")
+                return await self._transition_locked(
+                    connection,
+                    self._record(row),
+                    target,
+                    event_type=event_type,
+                    event_payload=event_payload or {},
+                    filled_quantity=filled_quantity,
+                    first_fill_at=first_fill_at,
+                    entry_exchange_order_id=entry_exchange_order_id,
+                    stop_client_order_id=stop_client_order_id,
+                    stop_exchange_order_id=stop_exchange_order_id,
+                    target_client_order_id=target_client_order_id,
+                    target_exchange_order_id=target_exchange_order_id,
+                    close_client_order_id=close_client_order_id,
+                    close_exchange_order_id=close_exchange_order_id,
+                )
+
+    async def transition_with_execution_event(
+        self,
+        trade_id: str,
+        target: TradeState,
+        *,
+        event_type: str,
+        fact_key: str,
+        build: Callable[[int], TradeExecutionEventV1],
+        event_payload: dict[str, Any] | None = None,
+        filled_quantity: float | None = None,
+        first_fill_at: datetime | None = None,
+        entry_exchange_order_id: str | None = None,
+        stop_client_order_id: str | None = None,
+        stop_exchange_order_id: str | None = None,
+        target_client_order_id: str | None = None,
+        target_exchange_order_id: str | None = None,
+        close_client_order_id: str | None = None,
+        close_exchange_order_id: str | None = None,
+    ) -> TradeMutationResult:
+        """Atomically advance the FSM and publish the corresponding strict fact.
+
+        If ``fact_key`` already exists, the original transition request and
+        canonical fact are verified under the trade lock. The transition is
+        not applied again, even if the trade has since reached a later state.
+        """
+
+        self._validate_transition_arguments(trade_id=trade_id, event_type=event_type)
+        self._validate_fact_arguments(fact_key=fact_key, build=build)
         payload = event_payload or {}
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -381,144 +428,290 @@ class TradeLifecycleRepository:
                 if row is None:
                     raise KeyError(f"unknown trade {trade_id!r}")
                 current = self._record(row)
-                validate_trade_transition(current.state, target)
-                next_filled = current.filled_quantity if filled_quantity is None else filled_quantity
-                if not math.isfinite(next_filled) or not 0 <= next_filled <= current.quantity:
-                    raise ValueError("filled_quantity is outside the trade quantity")
-                if next_filled < current.filled_quantity:
-                    raise ValueError("filled_quantity must be monotonic")
-                if first_fill_at is not None and first_fill_at.tzinfo is None:
-                    raise ValueError("first_fill_at must be timezone-aware")
-                supplied_first_fill = None if first_fill_at is None else first_fill_at.astimezone(UTC)
-                current_first_fill = (
-                    None if current.first_fill_at is None else current.first_fill_at.astimezone(UTC)
-                )
-                if (
-                    supplied_first_fill is not None
-                    and current_first_fill is not None
-                    and supplied_first_fill != current_first_fill
-                ):
-                    raise MessageIdentityConflict("first_fill_at is immutable once recorded")
-                effective_first_fill = current_first_fill or supplied_first_fill
-                if next_filled > 0 and effective_first_fill is None:
-                    raise ValueError("the first non-zero fill must record first_fill_at")
-                if next_filled == 0 and effective_first_fill is not None:
-                    raise ValueError("first_fill_at requires a non-zero fill")
-                if target is TradeState.CANCELLED and next_filled > 0:
-                    raise ValueError("a partially filled trade cannot be cancelled")
-                if (
-                    target
-                    in {
-                        TradeState.PROTECTING,
-                        TradeState.ACTIVE,
-                        TradeState.EXITING_STOP,
-                        TradeState.EXITING_TARGET,
-                        TradeState.EXITING_TIMEOUT,
-                        TradeState.EXITING_EMERGENCY,
-                    }
-                    and next_filled <= 0
-                ):
-                    raise ValueError(f"{target.value} requires a non-zero fill")
-                try:
-                    timeout_at = (
-                        None
-                        if effective_first_fill is None
-                        else effective_first_fill + timedelta(milliseconds=current.max_holding_ms)
+                existing = await self._execution_fact_row(connection, trade_id, fact_key)
+                if existing is not None:
+                    existing_event = self._execution_event(existing["payload"], existing["payload_sha256"])
+                    if existing_event.lifecycle_state is not target:
+                        raise MessageIdentityConflict(
+                            "execution fact_key belongs to a different lifecycle state"
+                        )
+                    await self._validate_transition_replay(
+                        connection,
+                        trade_id=trade_id,
+                        state_version=int(existing["state_version"]),
+                        target=target,
+                        event_type=event_type,
+                        event_payload=payload,
+                        filled_quantity=filled_quantity,
+                        first_fill_at=first_fill_at,
+                        entry_exchange_order_id=entry_exchange_order_id,
+                        stop_client_order_id=stop_client_order_id,
+                        stop_exchange_order_id=stop_exchange_order_id,
+                        target_client_order_id=target_client_order_id,
+                        target_exchange_order_id=target_exchange_order_id,
+                        close_client_order_id=close_client_order_id,
+                        close_exchange_order_id=close_exchange_order_id,
                     )
-                except OverflowError as exc:
-                    raise ValueError("max_holding_ms exceeds the supported timestamp range") from exc
-                effective_entry_exchange_id = self._merge_identifier(
-                    "entry_exchange_order_id",
-                    current.entry_exchange_order_id,
-                    entry_exchange_order_id,
-                )
-                effective_stop_client_id = self._merge_identifier(
-                    "stop_client_order_id", current.stop_client_order_id, stop_client_order_id
-                )
-                effective_stop_exchange_id = self._merge_identifier(
-                    "stop_exchange_order_id",
-                    current.stop_exchange_order_id,
-                    stop_exchange_order_id,
-                )
-                effective_target_client_id = self._merge_identifier(
-                    "target_client_order_id", current.target_client_order_id, target_client_order_id
-                )
-                effective_target_exchange_id = self._merge_identifier(
-                    "target_exchange_order_id",
-                    current.target_exchange_order_id,
-                    target_exchange_order_id,
-                )
-                effective_close_client_id = self._merge_identifier(
-                    "close_client_order_id", current.close_client_order_id, close_client_order_id
-                )
-                effective_close_exchange_id = self._merge_identifier(
-                    "close_exchange_order_id",
-                    current.close_exchange_order_id,
-                    close_exchange_order_id,
-                )
-                transition_payload = {
-                    "event": payload,
-                    "filled_quantity_hex": float(next_filled).hex(),
-                    "first_fill_at": (
-                        None
-                        if effective_first_fill is None
-                        else effective_first_fill.astimezone(UTC).isoformat()
-                    ),
-                    "entry_exchange_order_id": effective_entry_exchange_id,
-                    "stop_client_order_id": effective_stop_client_id,
-                    "stop_exchange_order_id": effective_stop_exchange_id,
-                    "target_client_order_id": effective_target_client_id,
-                    "target_exchange_order_id": effective_target_exchange_id,
-                    "close_client_order_id": effective_close_client_id,
-                    "close_exchange_order_id": effective_close_exchange_id,
-                }
-                event_sha = self._event_sha(
-                    trade_id,
-                    current.state,
-                    target,
-                    event_type,
-                    transition_payload,
-                    current.journal_head_sha256,
-                )
-                updated = await connection.fetchrow(
-                    """UPDATE execution_trades SET
-                         state=$2, filled_quantity=$3, first_fill_at=$4, timeout_at=$5,
-                         entry_exchange_order_id=COALESCE($6,entry_exchange_order_id),
-                         stop_client_order_id=COALESCE($7,stop_client_order_id),
-                         stop_exchange_order_id=COALESCE($8,stop_exchange_order_id),
-                         target_client_order_id=COALESCE($9,target_client_order_id),
-                         target_exchange_order_id=COALESCE($10,target_exchange_order_id),
-                         close_client_order_id=COALESCE($11,close_client_order_id),
-                         close_exchange_order_id=COALESCE($12,close_exchange_order_id),
-                         state_version=state_version+1, journal_head_sha256=$13, updated_at=now()
-                       WHERE trade_id=$1 AND state_version=$14 RETURNING *""",
-                    trade_id,
-                    target.value,
-                    next_filled,
-                    None if effective_first_fill is None else effective_first_fill.astimezone(UTC),
-                    timeout_at,
-                    effective_entry_exchange_id,
-                    effective_stop_client_id,
-                    effective_stop_exchange_id,
-                    effective_target_client_id,
-                    effective_target_exchange_id,
-                    effective_close_client_id,
-                    effective_close_exchange_id,
-                    event_sha,
-                    current.state_version,
-                )
-                if updated is None:
-                    raise RuntimeError("trade transition lost its serialized state version")
-                await self._append_event(
+                    event = await self._append_execution_event_locked(
+                        connection,
+                        current,
+                        fact_key=fact_key,
+                        expected_state_version=int(existing["state_version"]),
+                        build=build,
+                    )
+                    return TradeMutationResult(trade=current, event=event)
+
+                updated = await self._transition_locked(
                     connection,
-                    trade_id,
-                    current.state,
+                    current,
                     target,
-                    event_type,
-                    transition_payload,
-                    current.journal_head_sha256,
-                    event_sha,
+                    event_type=event_type,
+                    event_payload=payload,
+                    filled_quantity=filled_quantity,
+                    first_fill_at=first_fill_at,
+                    entry_exchange_order_id=entry_exchange_order_id,
+                    stop_client_order_id=stop_client_order_id,
+                    stop_exchange_order_id=stop_exchange_order_id,
+                    target_client_order_id=target_client_order_id,
+                    target_exchange_order_id=target_exchange_order_id,
+                    close_client_order_id=close_client_order_id,
+                    close_exchange_order_id=close_exchange_order_id,
                 )
+                event = await self._append_execution_event_locked(
+                    connection,
+                    updated,
+                    fact_key=fact_key,
+                    expected_state_version=updated.state_version,
+                    build=build,
+                )
+                return TradeMutationResult(trade=updated, event=event)
+
+    async def _create_locked(self, connection: asyncpg.Connection, trade: NewTrade) -> TradeRecord:
+        immutable = self._new_trade_payload(trade)
+        existing = await connection.fetchrow(
+            "SELECT * FROM execution_trades WHERE trade_id=$1 FOR UPDATE", trade.trade_id
+        )
+        if existing is not None:
+            record = self._record(existing)
+            if self._immutable_record_payload(record) != immutable:
+                raise MessageIdentityConflict(
+                    f"trade_id {trade.trade_id!r} was reused with different immutable content"
+                )
+            return record
+
+        payload = {"trade": immutable}
+        event_sha = self._event_sha(
+            trade.trade_id,
+            None,
+            TradeState.RECEIVED,
+            "CREATED",
+            payload,
+            None,
+        )
+        row = await connection.fetchrow(
+            """INSERT INTO execution_trades
+               (trade_id, strategy_intent_id, risk_decision_id,
+                risk_decision_sha256, risk_decision_payload, strategy_id, strategy_revision,
+                trading_mode, environment, profile, exchange, account_id, symbol, venue_symbol, side,
+                quantity, leverage, stop_price, target_price, entry_eligible_at, entry_expires_at,
+                max_holding_ms, state, entry_client_order_id, journal_head_sha256)
+               VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                       $18,$19,$20,$21,$22,'RECEIVED',$23,$24)
+               RETURNING *""",
+            trade.trade_id,
+            trade.strategy_intent_id,
+            trade.risk_decision_id,
+            canonical_payload(trade.risk_decision_payload)[1],
+            self._json(trade.risk_decision_payload),
+            trade.strategy_id,
+            trade.strategy_revision,
+            trade.trading_mode,
+            trade.environment,
+            trade.profile,
+            trade.exchange,
+            trade.account_id,
+            trade.symbol,
+            trade.venue_symbol,
+            trade.side,
+            trade.quantity,
+            trade.leverage,
+            trade.stop_price,
+            trade.target_price,
+            trade.entry_eligible_at.astimezone(UTC),
+            trade.entry_expires_at.astimezone(UTC),
+            trade.max_holding_ms,
+            trade.entry_client_order_id,
+            event_sha,
+        )
+        if row is None:
+            raise RuntimeError("trade lifecycle create returned no row")
+        await self._append_event(
+            connection,
+            trade.trade_id,
+            None,
+            TradeState.RECEIVED,
+            "CREATED",
+            payload,
+            None,
+            event_sha,
+        )
+        return self._record(row)
+
+    async def _transition_locked(
+        self,
+        connection: asyncpg.Connection,
+        current: TradeRecord,
+        target: TradeState,
+        *,
+        event_type: str,
+        event_payload: dict[str, Any],
+        filled_quantity: float | None,
+        first_fill_at: datetime | None,
+        entry_exchange_order_id: str | None,
+        stop_client_order_id: str | None,
+        stop_exchange_order_id: str | None,
+        target_client_order_id: str | None,
+        target_exchange_order_id: str | None,
+        close_client_order_id: str | None,
+        close_exchange_order_id: str | None,
+    ) -> TradeRecord:
+        validate_trade_transition(current.state, target)
+        next_filled = current.filled_quantity if filled_quantity is None else filled_quantity
+        if not math.isfinite(next_filled) or not 0 <= next_filled <= current.quantity:
+            raise ValueError("filled_quantity is outside the trade quantity")
+        if next_filled < current.filled_quantity:
+            raise ValueError("filled_quantity must be monotonic")
+        if first_fill_at is not None and first_fill_at.tzinfo is None:
+            raise ValueError("first_fill_at must be timezone-aware")
+        supplied_first_fill = None if first_fill_at is None else first_fill_at.astimezone(UTC)
+        current_first_fill = None if current.first_fill_at is None else current.first_fill_at.astimezone(UTC)
+        if (
+            supplied_first_fill is not None
+            and current_first_fill is not None
+            and supplied_first_fill != current_first_fill
+        ):
+            raise MessageIdentityConflict("first_fill_at is immutable once recorded")
+        effective_first_fill = current_first_fill or supplied_first_fill
+        if next_filled > 0 and effective_first_fill is None:
+            raise ValueError("the first non-zero fill must record first_fill_at")
+        if next_filled == 0 and effective_first_fill is not None:
+            raise ValueError("first_fill_at requires a non-zero fill")
+        if target is TradeState.CANCELLED and next_filled > 0:
+            raise ValueError("a partially filled trade cannot be cancelled")
+        if (
+            target
+            in {
+                TradeState.PROTECTING,
+                TradeState.ACTIVE,
+                TradeState.EXITING_STOP,
+                TradeState.EXITING_TARGET,
+                TradeState.EXITING_TIMEOUT,
+                TradeState.EXITING_EMERGENCY,
+            }
+            and next_filled <= 0
+        ):
+            raise ValueError(f"{target.value} requires a non-zero fill")
+        try:
+            timeout_at = (
+                None
+                if effective_first_fill is None
+                else effective_first_fill + timedelta(milliseconds=current.max_holding_ms)
+            )
+        except OverflowError as exc:
+            raise ValueError("max_holding_ms exceeds the supported timestamp range") from exc
+
+        effective_entry_exchange_id = self._merge_identifier(
+            "entry_exchange_order_id",
+            current.entry_exchange_order_id,
+            entry_exchange_order_id,
+        )
+        effective_stop_client_id = self._merge_identifier(
+            "stop_client_order_id", current.stop_client_order_id, stop_client_order_id
+        )
+        effective_stop_exchange_id = self._merge_identifier(
+            "stop_exchange_order_id",
+            current.stop_exchange_order_id,
+            stop_exchange_order_id,
+        )
+        effective_target_client_id = self._merge_identifier(
+            "target_client_order_id",
+            current.target_client_order_id,
+            target_client_order_id,
+        )
+        effective_target_exchange_id = self._merge_identifier(
+            "target_exchange_order_id",
+            current.target_exchange_order_id,
+            target_exchange_order_id,
+        )
+        effective_close_client_id = self._merge_identifier(
+            "close_client_order_id", current.close_client_order_id, close_client_order_id
+        )
+        effective_close_exchange_id = self._merge_identifier(
+            "close_exchange_order_id",
+            current.close_exchange_order_id,
+            close_exchange_order_id,
+        )
+        transition_payload = {
+            "event": event_payload,
+            "filled_quantity_hex": float(next_filled).hex(),
+            "first_fill_at": (
+                None if effective_first_fill is None else effective_first_fill.astimezone(UTC).isoformat()
+            ),
+            "entry_exchange_order_id": effective_entry_exchange_id,
+            "stop_client_order_id": effective_stop_client_id,
+            "stop_exchange_order_id": effective_stop_exchange_id,
+            "target_client_order_id": effective_target_client_id,
+            "target_exchange_order_id": effective_target_exchange_id,
+            "close_client_order_id": effective_close_client_id,
+            "close_exchange_order_id": effective_close_exchange_id,
+        }
+        event_sha = self._event_sha(
+            current.trade_id,
+            current.state,
+            target,
+            event_type,
+            transition_payload,
+            current.journal_head_sha256,
+        )
+        updated = await connection.fetchrow(
+            """UPDATE execution_trades SET
+                 state=$2, filled_quantity=$3, first_fill_at=$4, timeout_at=$5,
+                 entry_exchange_order_id=COALESCE($6,entry_exchange_order_id),
+                 stop_client_order_id=COALESCE($7,stop_client_order_id),
+                 stop_exchange_order_id=COALESCE($8,stop_exchange_order_id),
+                 target_client_order_id=COALESCE($9,target_client_order_id),
+                 target_exchange_order_id=COALESCE($10,target_exchange_order_id),
+                 close_client_order_id=COALESCE($11,close_client_order_id),
+                 close_exchange_order_id=COALESCE($12,close_exchange_order_id),
+                 state_version=state_version+1, journal_head_sha256=$13, updated_at=now()
+               WHERE trade_id=$1 AND state_version=$14 RETURNING *""",
+            current.trade_id,
+            target.value,
+            next_filled,
+            None if effective_first_fill is None else effective_first_fill.astimezone(UTC),
+            timeout_at,
+            effective_entry_exchange_id,
+            effective_stop_client_id,
+            effective_stop_exchange_id,
+            effective_target_client_id,
+            effective_target_exchange_id,
+            effective_close_client_id,
+            effective_close_exchange_id,
+            event_sha,
+            current.state_version,
+        )
+        if updated is None:
+            raise RuntimeError("trade transition lost its serialized state version")
+        await self._append_event(
+            connection,
+            current.trade_id,
+            current.state,
+            target,
+            event_type,
+            transition_payload,
+            current.journal_head_sha256,
+            event_sha,
+        )
         return self._record(updated)
 
     async def mark_reconciled(self, trade_id: str, detail: str) -> TradeRecord:
@@ -543,6 +736,31 @@ class TradeLifecycleRepository:
                ORDER BY created_at, trade_id""",
             environment,
             account_id,
+        )
+        return [self._record(row) for row in rows]
+
+    async def list_trades_for_scope(
+        self,
+        *,
+        environment: str,
+        account_id: str,
+        exchange: str,
+        include_terminal: bool = True,
+    ) -> list[TradeRecord]:
+        """List every scoped trade for authoritative startup fact auditing."""
+
+        self._validate_scope(environment, account_id, exchange)
+        if not isinstance(include_terminal, bool):
+            raise TypeError("include_terminal must be a boolean")
+        rows = await self.pool.fetch(
+            """SELECT * FROM execution_trades
+               WHERE environment=$1 AND account_id=$2 AND exchange=$3
+                 AND ($4::boolean OR state NOT IN ('FLAT','CANCELLED'))
+               ORDER BY created_at, trade_id""",
+            environment,
+            account_id,
+            exchange,
+            include_terminal,
         )
         return [self._record(row) for row in rows]
 
@@ -656,25 +874,18 @@ class TradeLifecycleRepository:
         expected_state_version: int,
         build: Callable[[int], TradeExecutionEventV1],
     ) -> TradeExecutionEventV1:
-        """Atomically persist a strict public fact and enqueue its durable outbox row.
+        """Persist a standalone strict public fact and its durable outbox row.
 
-        ``fact_key`` identifies the lifecycle fact independently of sequence and
-        wall-clock time. Replays must rebuild the exact same canonical event.
+        Lifecycle-changing execution paths must use
+        :meth:`transition_with_execution_event` instead.
         """
 
         self._validate_text("trade_id", trade_id)
-        if not fact_key or fact_key != fact_key.strip() or len(fact_key) > 512:
-            raise ValueError("fact_key must be normalized and at most 512 characters")
-        if (
-            isinstance(expected_state_version, bool)
-            or not isinstance(expected_state_version, int)
-            or expected_state_version < 0
-        ):
-            raise ValueError("expected_state_version must be a non-negative integer")
-        if not callable(build):
-            raise TypeError("build must be callable")
-
-        audit = AuditRepository(self.pool)
+        self._validate_fact_arguments(
+            fact_key=fact_key,
+            build=build,
+            expected_state_version=expected_state_version,
+        )
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 await self._xact_lock(connection, trade_id)
@@ -684,88 +895,218 @@ class TradeLifecycleRepository:
                 )
                 if trade_row is None:
                     raise KeyError(f"unknown trade {trade_id!r}")
-                trade = self._record(trade_row)
-                existing = await connection.fetchrow(
-                    """SELECT event_seq,state_version,event_id,payload,payload_sha256
-                         FROM public_execution_events
-                        WHERE trade_id=$1 AND fact_key=$2""",
-                    trade_id,
-                    fact_key,
-                )
-                if existing is not None:
-                    if int(existing["state_version"]) != expected_state_version:
-                        raise MessageIdentityConflict(
-                            "execution fact was replayed against a different trade state version"
-                        )
-                    event = self._execution_event(existing["payload"], existing["payload_sha256"])
-                    self._validate_execution_event(event, trade, require_current_state=False)
-                    rebuilt = build(int(existing["event_seq"]))
-                    if rebuilt.event_seq != int(existing["event_seq"]):
-                        raise ValueError("public execution event builder returned the wrong sequence")
-                    self._validate_execution_event(rebuilt, trade, require_current_state=False)
-                    if canonical_payload(rebuilt.model_dump(mode="json"))[1] != existing["payload_sha256"]:
-                        raise MessageIdentityConflict(
-                            f"execution fact_key {fact_key!r} was reused with different content"
-                        )
-                    await audit.append_event(
-                        TRADE_EXECUTION_EVENT_TOPIC,
-                        event,
-                        connection=connection,
-                    )
-                    encoded, fingerprint = canonical_payload(event.model_dump(mode="json"))
-                    await audit.enqueue_outbox(
-                        connection,
-                        event.message_id,
-                        TRADE_EXECUTION_EVENT_TOPIC,
-                        encoded,
-                        fingerprint,
-                    )
-                    return event
-
-                if trade.state_version != expected_state_version:
-                    raise RuntimeError("trade state changed before its public execution fact was appended")
-                sequence = int(trade_row["next_execution_event_seq"])
-                event = build(sequence)
-                if event.event_seq != sequence:
-                    raise ValueError("public execution event builder returned the wrong sequence")
-                self._validate_execution_event(event, trade, require_current_state=True)
-                encoded, fingerprint = canonical_payload(event.model_dump(mode="json"))
-                result = await connection.execute(
-                    """INSERT INTO public_execution_events
-                       (trade_id,fact_key,event_seq,state_version,event_id,payload,payload_sha256)
-                       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)""",
-                    trade_id,
-                    fact_key,
-                    sequence,
-                    expected_state_version,
-                    event.event_id,
-                    encoded,
-                    fingerprint,
-                )
-                if not result.endswith(" 1"):
-                    raise RuntimeError("public execution event insert did not affect one row")
-                advanced = await connection.execute(
-                    """UPDATE execution_trades
-                          SET next_execution_event_seq=next_execution_event_seq+1, updated_at=now()
-                        WHERE trade_id=$1 AND next_execution_event_seq=$2""",
-                    trade_id,
-                    sequence,
-                )
-                if not advanced.endswith(" 1"):
-                    raise RuntimeError("public execution event sequence was not advanced")
-                await audit.append_event(
-                    TRADE_EXECUTION_EVENT_TOPIC,
-                    event,
-                    connection=connection,
-                )
-                await audit.enqueue_outbox(
+                return await self._append_execution_event_locked(
                     connection,
-                    event.message_id,
-                    TRADE_EXECUTION_EVENT_TOPIC,
-                    encoded,
-                    fingerprint,
+                    self._record(trade_row),
+                    fact_key=fact_key,
+                    expected_state_version=expected_state_version,
+                    build=build,
                 )
-                return event
+
+    async def _append_execution_event_locked(
+        self,
+        connection: asyncpg.Connection,
+        trade: TradeRecord,
+        *,
+        fact_key: str,
+        expected_state_version: int,
+        build: Callable[[int], TradeExecutionEventV1],
+    ) -> TradeExecutionEventV1:
+        existing = await self._execution_fact_row(connection, trade.trade_id, fact_key)
+        audit = AuditRepository(self.pool)
+        if existing is not None:
+            if int(existing["state_version"]) != expected_state_version:
+                raise MessageIdentityConflict(
+                    "execution fact was replayed against a different trade state version"
+                )
+            event = self._execution_event(existing["payload"], existing["payload_sha256"])
+            self._validate_execution_event(event, trade, require_current_state=False)
+            rebuilt = build(int(existing["event_seq"]))
+            if rebuilt.event_seq != int(existing["event_seq"]):
+                raise ValueError("public execution event builder returned the wrong sequence")
+            self._validate_execution_event(rebuilt, trade, require_current_state=False)
+            if canonical_payload(rebuilt.model_dump(mode="json"))[1] != existing["payload_sha256"]:
+                raise MessageIdentityConflict(
+                    f"execution fact_key {fact_key!r} was reused with different content"
+                )
+            await audit.append_event(
+                TRADE_EXECUTION_EVENT_TOPIC,
+                event,
+                connection=connection,
+            )
+            encoded, fingerprint = canonical_payload(event.model_dump(mode="json"))
+            await audit.enqueue_outbox(
+                connection,
+                event.message_id,
+                TRADE_EXECUTION_EVENT_TOPIC,
+                encoded,
+                fingerprint,
+            )
+            return event
+
+        if trade.state_version != expected_state_version:
+            raise RuntimeError("trade state changed before its public execution fact was appended")
+        sequence_row = await connection.fetchrow(
+            "SELECT next_execution_event_seq FROM execution_trades WHERE trade_id=$1",
+            trade.trade_id,
+        )
+        if sequence_row is None:
+            raise KeyError(f"unknown trade {trade.trade_id!r}")
+        sequence = int(sequence_row["next_execution_event_seq"])
+        event = build(sequence)
+        if event.event_seq != sequence:
+            raise ValueError("public execution event builder returned the wrong sequence")
+        self._validate_execution_event(event, trade, require_current_state=True)
+        encoded, fingerprint = canonical_payload(event.model_dump(mode="json"))
+        result = await connection.execute(
+            """INSERT INTO public_execution_events
+               (trade_id,fact_key,event_seq,state_version,event_id,payload,payload_sha256)
+               VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)""",
+            trade.trade_id,
+            fact_key,
+            sequence,
+            expected_state_version,
+            event.event_id,
+            encoded,
+            fingerprint,
+        )
+        if not result.endswith(" 1"):
+            raise RuntimeError("public execution event insert did not affect one row")
+        advanced = await connection.execute(
+            """UPDATE execution_trades
+                  SET next_execution_event_seq=next_execution_event_seq+1, updated_at=now()
+                WHERE trade_id=$1 AND next_execution_event_seq=$2""",
+            trade.trade_id,
+            sequence,
+        )
+        if not advanced.endswith(" 1"):
+            raise RuntimeError("public execution event sequence was not advanced")
+        await audit.append_event(
+            TRADE_EXECUTION_EVENT_TOPIC,
+            event,
+            connection=connection,
+        )
+        await audit.enqueue_outbox(
+            connection,
+            event.message_id,
+            TRADE_EXECUTION_EVENT_TOPIC,
+            encoded,
+            fingerprint,
+        )
+        return event
+
+    @staticmethod
+    async def _execution_fact_row(
+        connection: asyncpg.Connection, trade_id: str, fact_key: str
+    ) -> asyncpg.Record | None:
+        return await connection.fetchrow(
+            """SELECT event_seq,state_version,event_id,payload,payload_sha256
+                 FROM public_execution_events
+                WHERE trade_id=$1 AND fact_key=$2""",
+            trade_id,
+            fact_key,
+        )
+
+    async def _validate_transition_replay(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        trade_id: str,
+        state_version: int,
+        target: TradeState,
+        event_type: str,
+        event_payload: dict[str, Any],
+        filled_quantity: float | None,
+        first_fill_at: datetime | None,
+        entry_exchange_order_id: str | None,
+        stop_client_order_id: str | None,
+        stop_exchange_order_id: str | None,
+        target_client_order_id: str | None,
+        target_exchange_order_id: str | None,
+        close_client_order_id: str | None,
+        close_exchange_order_id: str | None,
+    ) -> None:
+        if state_version <= 0:
+            raise MessageIdentityConflict("transition fact must reference a positive state version")
+        rows = await connection.fetch(
+            """SELECT from_state,to_state,event_type,event_payload
+                 FROM execution_trade_events
+                WHERE trade_id=$1 ORDER BY sequence OFFSET $2 LIMIT 2""",
+            trade_id,
+            state_version - 1,
+        )
+        if len(rows) != 2:
+            raise MessageIdentityConflict("transition fact has no matching lifecycle journal entry")
+        previous, transition = rows
+        if (
+            transition["from_state"] != previous["to_state"]
+            or transition["to_state"] != target.value
+            or transition["event_type"] != event_type
+        ):
+            raise MessageIdentityConflict("execution fact_key belongs to a different lifecycle transition")
+
+        previous_payload = self._object(previous["event_payload"])
+        stored_payload = self._object(transition["event_payload"])
+        if previous["event_type"] == "CREATED":
+            prior_filled = 0.0
+            prior_first_fill: datetime | None = None
+            prior_identifiers = {
+                "entry_exchange_order_id": None,
+                "stop_client_order_id": None,
+                "stop_exchange_order_id": None,
+                "target_client_order_id": None,
+                "target_exchange_order_id": None,
+                "close_client_order_id": None,
+                "close_exchange_order_id": None,
+            }
+        else:
+            prior_filled = float.fromhex(str(previous_payload["filled_quantity_hex"]))
+            prior_first_fill = self._parse_optional_timestamp(previous_payload["first_fill_at"])
+            prior_identifiers = {
+                name: previous_payload[name]
+                for name in (
+                    "entry_exchange_order_id",
+                    "stop_client_order_id",
+                    "stop_exchange_order_id",
+                    "target_client_order_id",
+                    "target_exchange_order_id",
+                    "close_client_order_id",
+                    "close_exchange_order_id",
+                )
+            }
+
+        next_filled = prior_filled if filled_quantity is None else filled_quantity
+        supplied_first_fill = self._normalize_optional_timestamp(first_fill_at)
+        if (
+            supplied_first_fill is not None
+            and prior_first_fill is not None
+            and supplied_first_fill != prior_first_fill
+        ):
+            raise MessageIdentityConflict("first_fill_at is immutable once recorded")
+        effective_first_fill = prior_first_fill or supplied_first_fill
+        supplied_identifiers = {
+            "entry_exchange_order_id": entry_exchange_order_id,
+            "stop_client_order_id": stop_client_order_id,
+            "stop_exchange_order_id": stop_exchange_order_id,
+            "target_client_order_id": target_client_order_id,
+            "target_exchange_order_id": target_exchange_order_id,
+            "close_client_order_id": close_client_order_id,
+            "close_exchange_order_id": close_exchange_order_id,
+        }
+        effective_identifiers = {
+            name: self._merge_identifier(name, prior_identifiers[name], supplied)
+            for name, supplied in supplied_identifiers.items()
+        }
+        expected_payload = {
+            "event": event_payload,
+            "filled_quantity_hex": float(next_filled).hex(),
+            "first_fill_at": (
+                None if effective_first_fill is None else effective_first_fill.astimezone(UTC).isoformat()
+            ),
+            **effective_identifiers,
+        }
+        if canonical_payload(expected_payload)[1] != canonical_payload(stored_payload)[1]:
+            raise MessageIdentityConflict("execution fact_key was reused for a different transition request")
 
     async def list_execution_events(self, trade_id: str) -> list[TradeExecutionEventV1]:
         self._validate_text("trade_id", trade_id)
@@ -937,6 +1278,49 @@ class TradeLifecycleRepository:
             raise MessageIdentityConflict(
                 "public execution event differs from durable trade lineage: " + ", ".join(sorted(mismatches))
             )
+
+    @classmethod
+    def _validate_fact_arguments(
+        cls,
+        *,
+        fact_key: str,
+        build: Callable[[int], TradeExecutionEventV1],
+        expected_state_version: int | None = None,
+    ) -> None:
+        if not fact_key or fact_key != fact_key.strip() or len(fact_key) > 512:
+            raise ValueError("fact_key must be normalized and at most 512 characters")
+        if not callable(build):
+            raise TypeError("build must be callable")
+        if expected_state_version is not None and (
+            isinstance(expected_state_version, bool)
+            or not isinstance(expected_state_version, int)
+            or expected_state_version < 0
+        ):
+            raise ValueError("expected_state_version must be a non-negative integer")
+
+    @classmethod
+    def _validate_transition_arguments(cls, *, trade_id: str, event_type: str) -> None:
+        cls._validate_text("trade_id", trade_id)
+        cls._validate_text("event_type", event_type)
+
+    @staticmethod
+    def _normalize_optional_timestamp(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("first_fill_at must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _parse_optional_timestamp(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise MessageIdentityConflict("stored lifecycle timestamp is not a string")
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.utcoffset() is None:
+            raise MessageIdentityConflict("stored lifecycle timestamp is not timezone-aware")
+        return parsed.astimezone(UTC)
 
     @staticmethod
     def _validate_text(name: str, value: str) -> None:

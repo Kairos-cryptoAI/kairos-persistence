@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from kairos_core import (
@@ -14,6 +15,7 @@ from kairos_core import (
     EntryPolicy,
     EvedexProfile,
     ExitPlanV1,
+    OrderRole,
     ReasoningEffort,
     ReviewDecision,
     RiskTradeDecisionV1,
@@ -28,11 +30,13 @@ from kairos_core import (
 )
 
 from kairos_persistence import (
+    AuditRepository,
     Database,
     MessageIdentityConflict,
     NewTrade,
     PersistenceSettings,
     TradeLifecycleRepository,
+    TradeMutationResult,
     TradeState,
     validate_trade_transition,
 )
@@ -226,6 +230,344 @@ def test_migration_enforces_one_active_trade_and_restart_barrier() -> None:
     assert "payload_sha256" in public_migration
 
 
+@pytest.mark.asyncio
+async def test_atomic_mutation_arguments_fail_before_database_access() -> None:
+    repository = TradeLifecycleRepository(None)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="fact_key"):
+        await repository.create_with_execution_event(
+            _trade(),
+            fact_key=" not-normalized ",
+            build=lambda _sequence: None,  # type: ignore[arg-type,return-value]
+        )
+    with pytest.raises(TypeError, match="callable"):
+        await repository.transition_with_execution_event(
+            _trade().trade_id,
+            TradeState.ENTRY_PENDING,
+            event_type="ENTRY_PREPARED",
+            fact_key="entry-prepared",
+            build=None,  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="include_terminal"):
+        await repository.list_trades_for_scope(
+            environment="evedex-dev",
+            account_id="paper-dev-1",
+            exchange="evedex",
+            include_terminal=1,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_atomic_trade_mutations_roll_back_replay_and_audit_terminal_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_url = os.getenv("KAIROS_PERSISTENCE_DATABASE_URL")
+    if not database_url:
+        pytest.skip("KAIROS_PERSISTENCE_DATABASE_URL is required for integration tests")
+    database = Database(PersistenceSettings(database_url=database_url))
+    await database.connect()
+    await database.migrate()
+    repository = TradeLifecycleRepository(database.pool)
+    trade_input = _trade()
+    trade_id = trade_input.trade_id
+    event_ids: list[str] = []
+
+    def execution_event(
+        sequence: int,
+        *,
+        event_type: TradeExecutionEventType,
+        state: TradeLifecycleState,
+        occurred_at_ms: int,
+    ) -> TradeExecutionEventV1:
+        detail: dict[str, Any] = {}
+        if event_type is TradeExecutionEventType.EFFECT_PREPARED:
+            detail = {
+                "effect_id": f"entry-place:{trade_id}",
+                "order_role": OrderRole.ENTRY,
+                "client_order_id": trade_input.entry_client_order_id,
+                "requested_quantity": trade_input.quantity,
+            }
+        return TradeExecutionEventV1(
+            source="execution-engine",
+            event_seq=sequence,
+            occurred_at_ms=occurred_at_ms,
+            event_type=event_type,
+            lifecycle_state=state,
+            trading_mode=TradingMode.PAPER,
+            evedex_profile=EvedexProfile.DEV,
+            account_id=trade_input.account_id,
+            venue_symbol=trade_input.venue_symbol,
+            strategy_id=trade_input.strategy_id,
+            strategy_revision=trade_input.strategy_revision,
+            intent_id=trade_input.strategy_intent_id,
+            risk_decision_id=trade_input.risk_decision_id,
+            trade_id=trade_id,
+            **detail,
+        )
+
+    received = lambda sequence: execution_event(  # noqa: E731
+        sequence,
+        event_type=TradeExecutionEventType.DECISION_RECEIVED,
+        state=TradeLifecycleState.RECEIVED,
+        occurred_at_ms=T0 + 60_400,
+    )
+    prepared = lambda sequence: execution_event(  # noqa: E731
+        sequence,
+        event_type=TradeExecutionEventType.EFFECT_PREPARED,
+        state=TradeLifecycleState.ENTRY_PENDING,
+        occurred_at_ms=T0 + 60_500,
+    )
+    cancelled = lambda sequence: execution_event(  # noqa: E731
+        sequence,
+        event_type=TradeExecutionEventType.ENTRY_CANCELLED,
+        state=TradeLifecycleState.CANCELLED,
+        occurred_at_ms=T0 + 60_600,
+    )
+    original_enqueue_outbox = AuditRepository.enqueue_outbox
+
+    async def fail_after_outbox_insert(
+        audit: AuditRepository,
+        connection: Any,
+        message_id: str,
+        topic: str,
+        payload: str,
+        payload_sha256: str,
+    ) -> bool:
+        await original_enqueue_outbox(
+            audit,
+            connection,
+            message_id,
+            topic,
+            payload,
+            payload_sha256,
+        )
+        raise RuntimeError("injected failure after outbox insert")
+
+    def fail_event_builder(_sequence: int) -> TradeExecutionEventV1:
+        raise RuntimeError("injected event builder failure")
+
+    try:
+        await database.pool.execute("DELETE FROM public_execution_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trade_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trades WHERE trade_id=$1", trade_id)
+
+        with pytest.raises(RuntimeError, match="event builder failure"):
+            await repository.create_with_execution_event(
+                trade_input,
+                fact_key="decision-builder-failure",
+                build=fail_event_builder,
+            )
+        assert await repository.get(trade_id) is None
+
+        monkeypatch.setattr(AuditRepository, "enqueue_outbox", fail_after_outbox_insert)
+        with pytest.raises(RuntimeError, match="after outbox insert"):
+            await repository.create_with_execution_event(
+                trade_input,
+                fact_key="decision-received",
+                build=received,
+            )
+        assert await repository.get(trade_id) is None
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM execution_trade_events WHERE trade_id=$1", trade_id
+            )
+            == 0
+        )
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM public_execution_events WHERE trade_id=$1", trade_id
+            )
+            == 0
+        )
+        failed_create_event_id = received(1).event_id
+        assert failed_create_event_id is not None
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM event_audit WHERE message_id=$1", failed_create_event_id
+            )
+            == 0
+        )
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM message_outbox WHERE message_id=$1", failed_create_event_id
+            )
+            == 0
+        )
+
+        monkeypatch.setattr(AuditRepository, "enqueue_outbox", original_enqueue_outbox)
+        created = await repository.create_with_execution_event(
+            trade_input,
+            fact_key="decision-received",
+            build=received,
+        )
+        assert isinstance(created, TradeMutationResult)
+        assert created.trade.state is TradeState.RECEIVED
+        assert created.trade.state_version == 0
+        assert created.event.event_seq == 1
+        assert created.event.event_id is not None
+        event_ids.append(created.event.event_id)
+
+        with pytest.raises(RuntimeError, match="event builder failure"):
+            await repository.transition_with_execution_event(
+                trade_id,
+                TradeState.ENTRY_PENDING,
+                event_type="ENTRY_PREPARED",
+                event_payload={"reason": "builder-failure"},
+                fact_key="entry-builder-failure",
+                build=fail_event_builder,
+            )
+        after_builder_failure = await repository.get(trade_id)
+        assert after_builder_failure is not None
+        assert after_builder_failure.state is TradeState.RECEIVED
+        assert after_builder_failure.state_version == 0
+
+        monkeypatch.setattr(AuditRepository, "enqueue_outbox", fail_after_outbox_insert)
+        with pytest.raises(RuntimeError, match="after outbox insert"):
+            await repository.transition_with_execution_event(
+                trade_id,
+                TradeState.ENTRY_PENDING,
+                event_type="ENTRY_PREPARED",
+                event_payload={"reason": "atomic-test"},
+                fact_key="entry-prepared",
+                build=prepared,
+            )
+        rolled_back = await repository.get(trade_id)
+        assert rolled_back is not None
+        assert rolled_back.state is TradeState.RECEIVED
+        assert rolled_back.state_version == 0
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM execution_trade_events WHERE trade_id=$1", trade_id
+            )
+            == 1
+        )
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM public_execution_events WHERE trade_id=$1", trade_id
+            )
+            == 1
+        )
+        failed_transition_event_id = prepared(2).event_id
+        assert failed_transition_event_id is not None
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM event_audit WHERE message_id=$1", failed_transition_event_id
+            )
+            == 0
+        )
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM message_outbox WHERE message_id=$1", failed_transition_event_id
+            )
+            == 0
+        )
+
+        monkeypatch.setattr(AuditRepository, "enqueue_outbox", original_enqueue_outbox)
+        pending_results = await asyncio.gather(
+            *(
+                repository.transition_with_execution_event(
+                    trade_id,
+                    TradeState.ENTRY_PENDING,
+                    event_type="ENTRY_PREPARED",
+                    event_payload={"reason": "atomic-test"},
+                    fact_key="entry-prepared",
+                    build=prepared,
+                )
+                for _ in range(2)
+            )
+        )
+        pending = pending_results[0]
+        assert pending_results[1].event == pending.event
+        assert pending_results[1].trade.state_version == 1
+        assert pending.trade.state_version == 1
+        assert pending.event.event_seq == 2
+        assert pending.event.event_id is not None
+        event_ids.append(pending.event.event_id)
+
+        terminal = await repository.transition_with_execution_event(
+            trade_id,
+            TradeState.CANCELLED,
+            event_type="ENTRY_EXPIRED",
+            event_payload={"reason": "fixture-expiry"},
+            fact_key="entry-cancelled",
+            build=cancelled,
+        )
+        assert terminal.trade.state is TradeState.CANCELLED
+        assert terminal.event.event_id is not None
+        event_ids.append(terminal.event.event_id)
+
+        replay = await repository.transition_with_execution_event(
+            trade_id,
+            TradeState.ENTRY_PENDING,
+            event_type="ENTRY_PREPARED",
+            event_payload={"reason": "atomic-test"},
+            fact_key="entry-prepared",
+            build=prepared,
+        )
+        assert replay.trade.state is TradeState.CANCELLED
+        assert replay.trade.state_version == 2
+        assert replay.event == pending.event
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM execution_trade_events WHERE trade_id=$1", trade_id
+            )
+            == 3
+        )
+        with pytest.raises(MessageIdentityConflict, match="different transition request"):
+            await repository.transition_with_execution_event(
+                trade_id,
+                TradeState.ENTRY_PENDING,
+                event_type="ENTRY_PREPARED",
+                event_payload={"reason": "changed"},
+                fact_key="entry-prepared",
+                build=prepared,
+            )
+
+        creation_replay = await repository.create_with_execution_event(
+            trade_input,
+            fact_key="decision-received",
+            build=received,
+        )
+        assert creation_replay.trade.state is TradeState.CANCELLED
+        assert creation_replay.event == created.event
+        assert [
+            item.trade_id
+            for item in await repository.list_trades_for_scope(
+                environment=trade_input.environment,
+                account_id=trade_input.account_id,
+                exchange=trade_input.exchange,
+            )
+        ] == [trade_id]
+        assert (
+            await repository.list_trades_for_scope(
+                environment=trade_input.environment,
+                account_id=trade_input.account_id,
+                exchange=trade_input.exchange,
+                include_terminal=False,
+            )
+            == []
+        )
+        assert await repository.verify_chain(trade_id)
+        assert (
+            await database.pool.fetchval(
+                "SELECT count(*) FROM message_outbox WHERE message_id=ANY($1::text[])", event_ids
+            )
+            == 3
+        )
+    finally:
+        monkeypatch.setattr(AuditRepository, "enqueue_outbox", original_enqueue_outbox)
+        if event_ids:
+            await database.pool.execute(
+                "DELETE FROM message_outbox WHERE message_id=ANY($1::text[])", event_ids
+            )
+            await database.pool.execute("DELETE FROM event_audit WHERE message_id=ANY($1::text[])", event_ids)
+        await database.pool.execute("DELETE FROM public_execution_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trade_events WHERE trade_id=$1", trade_id)
+        await database.pool.execute("DELETE FROM execution_trades WHERE trade_id=$1", trade_id)
+        await database.close()
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_public_execution_fact_and_outbox_are_atomic_replay_safe_and_scoped() -> None:
@@ -319,7 +661,7 @@ async def test_public_execution_fact_and_outbox_are_atomic_replay_safe_and_scope
                 risk_decision_id=trade_input.risk_decision_id,
                 trade_id=trade_id,
                 effect_id=f"entry-place:{trade_id}",
-                order_role="ENTRY",
+                order_role=OrderRole.ENTRY,
                 client_order_id=trade_input.entry_client_order_id,
                 requested_quantity=decision.quantity,
             )
