@@ -53,6 +53,10 @@ async def test_operations_query_covers_strict_paper_audit_and_lifecycle_tables()
         assert metrics.persistence_up == 1
         assert metrics.redis_up == 1
         assert metrics.closed_bar_gaps_24h >= 0
+        assert 0 <= metrics.closed_bar_minimum_coverage_ratio_24h <= 1
+        assert 0 <= metrics.venue_availability_ratio_24h <= 1
+        assert metrics.venue_max_book_age_ms >= 0
+        assert metrics.venue_max_timestamp_skew_ms >= 0
         assert metrics.paper_unprotected_trades >= 0
         assert metrics.execution_p95_shortfall_bps >= 0
         assert metrics.api_spend_month_usd >= 0

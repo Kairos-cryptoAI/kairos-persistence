@@ -26,11 +26,18 @@ class RuntimeMetrics:
     execution_failed: int
     oldest_outbox_age_seconds: float
     closed_bar_gaps_24h: int = 0
+    closed_bar_symbols_24h: int = 0
+    closed_bar_minimum_coverage_ratio_24h: float = 0.0
+    latest_closed_bar_age_seconds: float = 0.0
     venue_measurements_24h: int = 0
+    venue_availability_ratio_24h: float = 0.0
     venue_blocked_24h: int = 0
     venue_p95_abs_basis_bps: float = 0.0
     venue_p95_spread_bps: float = 0.0
     venue_p95_slippage_bps: float = 0.0
+    venue_max_book_age_ms: float = 0.0
+    venue_max_timestamp_skew_ms: float = 0.0
+    venue_p95_latency_ms: float = 0.0
     latest_venue_age_seconds: float = 0.0
     candidate_veto_24h: int = 0
     candidate_defer_24h: int = 0
@@ -47,7 +54,8 @@ RedisProbe = Callable[[str], Awaitable[bool]]
 _QUERY = """
 WITH closed_bars AS (
     SELECT payload->>'symbol' AS symbol,
-           (payload->>'open_time_ms')::bigint AS open_time_ms
+           (payload->>'open_time_ms')::bigint AS open_time_ms,
+           produced_at
       FROM event_audit
      WHERE topic='kairos.market.closed_bar.v1'
        AND produced_at >= now() - interval '24 hours'
@@ -55,6 +63,12 @@ WITH closed_bars AS (
     SELECT symbol, open_time_ms,
            lag(open_time_ms) OVER (PARTITION BY symbol ORDER BY open_time_ms) AS previous_open_time_ms
       FROM closed_bars
+), closed_bar_coverage AS (
+    SELECT symbol,
+           count(DISTINCT open_time_ms)::double precision AS bar_count,
+           max(produced_at) AS latest_produced_at
+      FROM closed_bars
+     GROUP BY symbol
 ), venue AS (
     SELECT produced_at,
            abs((payload->>'basis_bps')::double precision) AS abs_basis_bps,
@@ -63,6 +77,9 @@ WITH closed_bars AS (
                (payload->>'buy_slippage_bps')::double precision,
                (payload->>'sell_slippage_bps')::double precision
            ) AS slippage_bps,
+           (payload->>'book_age_ms')::double precision AS book_age_ms,
+           (payload->>'timestamp_skew_ms')::double precision AS timestamp_skew_ms,
+           (payload->>'latency_ms')::double precision AS latency_ms,
            (payload->>'entry_allowed')::boolean AS entry_allowed
       FROM event_audit
      WHERE topic='kairos.venue.quality.v1'
@@ -106,7 +123,14 @@ SELECT
     (SELECT count(*) FROM sequenced_bars
       WHERE previous_open_time_ms IS NOT NULL
         AND open_time_ms <> previous_open_time_ms + 60000)::bigint AS closed_bar_gaps_24h,
+    (SELECT count(*) FROM closed_bar_coverage)::bigint AS closed_bar_symbols_24h,
+    COALESCE((SELECT least(1.0, min(bar_count / 1440.0)) FROM closed_bar_coverage), 0)
+      ::double precision AS closed_bar_minimum_coverage_ratio_24h,
+    COALESCE((SELECT EXTRACT(EPOCH FROM now() - min(latest_produced_at))
+      FROM closed_bar_coverage), 0)::double precision AS latest_closed_bar_age_seconds,
     (SELECT count(*) FROM venue)::bigint AS venue_measurements_24h,
+    least(1.0, (SELECT count(*) FROM venue)::double precision / 14400.0)
+      AS venue_availability_ratio_24h,
     (SELECT count(*) FROM venue WHERE NOT entry_allowed)::bigint AS venue_blocked_24h,
     COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY abs_basis_bps) FROM venue), 0)
       ::double precision AS venue_p95_abs_basis_bps,
@@ -114,6 +138,12 @@ SELECT
       ::double precision AS venue_p95_spread_bps,
     COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY slippage_bps) FROM venue), 0)
       ::double precision AS venue_p95_slippage_bps,
+    COALESCE((SELECT max(book_age_ms) FROM venue), 0)
+      ::double precision AS venue_max_book_age_ms,
+    COALESCE((SELECT max(timestamp_skew_ms) FROM venue), 0)
+      ::double precision AS venue_max_timestamp_skew_ms,
+    COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM venue), 0)
+      ::double precision AS venue_p95_latency_ms,
     COALESCE((SELECT EXTRACT(EPOCH FROM now() - max(produced_at)) FROM venue), 0)
       ::double precision AS latest_venue_age_seconds,
     (SELECT count(*) FROM event_audit
@@ -210,11 +240,18 @@ async def collect_runtime_metrics(
         execution_failed=int(row["execution_failed"]),
         oldest_outbox_age_seconds=float(row["oldest_outbox_age_seconds"]),
         closed_bar_gaps_24h=int(row["closed_bar_gaps_24h"]),
+        closed_bar_symbols_24h=int(row["closed_bar_symbols_24h"]),
+        closed_bar_minimum_coverage_ratio_24h=float(row["closed_bar_minimum_coverage_ratio_24h"]),
+        latest_closed_bar_age_seconds=float(row["latest_closed_bar_age_seconds"]),
         venue_measurements_24h=int(row["venue_measurements_24h"]),
+        venue_availability_ratio_24h=float(row["venue_availability_ratio_24h"]),
         venue_blocked_24h=int(row["venue_blocked_24h"]),
         venue_p95_abs_basis_bps=float(row["venue_p95_abs_basis_bps"]),
         venue_p95_spread_bps=float(row["venue_p95_spread_bps"]),
         venue_p95_slippage_bps=float(row["venue_p95_slippage_bps"]),
+        venue_max_book_age_ms=float(row["venue_max_book_age_ms"]),
+        venue_max_timestamp_skew_ms=float(row["venue_max_timestamp_skew_ms"]),
+        venue_p95_latency_ms=float(row["venue_p95_latency_ms"]),
         latest_venue_age_seconds=float(row["latest_venue_age_seconds"]),
         candidate_veto_24h=int(row["candidate_veto_24h"]),
         candidate_defer_24h=int(row["candidate_defer_24h"]),
@@ -284,10 +321,34 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
             metrics.closed_bar_gaps_24h,
         ),
         (
+            "kairos_closed_bar_symbols_24h",
+            "Symbols with persisted closed one-minute bars over 24 hours.",
+            "gauge",
+            metrics.closed_bar_symbols_24h,
+        ),
+        (
+            "kairos_closed_bar_minimum_coverage_ratio_24h",
+            "Lowest per-symbol fraction of the expected 1440 closed bars over 24 hours.",
+            "gauge",
+            metrics.closed_bar_minimum_coverage_ratio_24h,
+        ),
+        (
+            "kairos_closed_bar_latest_age_seconds",
+            "Age of the oldest per-symbol latest closed-bar event.",
+            "gauge",
+            metrics.latest_closed_bar_age_seconds,
+        ),
+        (
             "kairos_venue_measurements_24h",
             "Persisted EVEDEX venue-quality measurements over 24 hours.",
             "gauge",
             metrics.venue_measurements_24h,
+        ),
+        (
+            "kairos_venue_availability_ratio_24h",
+            "Fraction of the expected five-symbol 30-second EVEDEX measurements over 24 hours.",
+            "gauge",
+            metrics.venue_availability_ratio_24h,
         ),
         (
             "kairos_venue_blocked_24h",
@@ -312,6 +373,24 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
             "24-hour p95 worst-side measured EVEDEX slippage in basis points.",
             "gauge",
             metrics.venue_p95_slippage_bps,
+        ),
+        (
+            "kairos_venue_max_book_age_ms",
+            "Maximum EVEDEX order-book age observed over 24 hours.",
+            "gauge",
+            metrics.venue_max_book_age_ms,
+        ),
+        (
+            "kairos_venue_max_timestamp_skew_ms",
+            "Maximum Binance-to-EVEDEX source timestamp skew observed over 24 hours.",
+            "gauge",
+            metrics.venue_max_timestamp_skew_ms,
+        ),
+        (
+            "kairos_venue_p95_latency_ms",
+            "24-hour p95 EVEDEX measurement request latency.",
+            "gauge",
+            metrics.venue_p95_latency_ms,
         ),
         (
             "kairos_venue_latest_age_seconds",

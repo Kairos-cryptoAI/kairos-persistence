@@ -49,11 +49,18 @@ async def test_collects_database_and_authenticated_redis_health():
         "execution_failed": 6,
         "oldest_outbox_age_seconds": 7.5,
         "closed_bar_gaps_24h": 0,
+        "closed_bar_symbols_24h": 5,
+        "closed_bar_minimum_coverage_ratio_24h": 1.0,
+        "latest_closed_bar_age_seconds": 65.0,
         "venue_measurements_24h": 120,
+        "venue_availability_ratio_24h": 0.99,
         "venue_blocked_24h": 2,
         "venue_p95_abs_basis_bps": 3.1,
         "venue_p95_spread_bps": 4.2,
         "venue_p95_slippage_bps": 5.3,
+        "venue_max_book_age_ms": 1_500,
+        "venue_max_timestamp_skew_ms": 900,
+        "venue_p95_latency_ms": 250,
         "latest_venue_age_seconds": 6.4,
         "candidate_veto_24h": 7,
         "candidate_defer_24h": 8,
@@ -86,11 +93,18 @@ async def test_collects_database_and_authenticated_redis_health():
         6,
         7.5,
         0,
+        5,
+        1.0,
+        65.0,
         120,
+        0.99,
         2,
         3.1,
         4.2,
         5.3,
+        1_500,
+        900,
+        250,
         6.4,
         7,
         8,
@@ -105,7 +119,10 @@ async def test_collects_database_and_authenticated_redis_health():
     assert "kairos_outbox_pending 2" in rendered
     assert "kairos_execution_effects_failed 6" in rendered
     assert "kairos_closed_bar_gaps_24h 0" in rendered
+    assert "kairos_closed_bar_minimum_coverage_ratio_24h 1.0" in rendered
+    assert "kairos_venue_availability_ratio_24h 0.99" in rendered
     assert "kairos_venue_p95_spread_bps 4.2" in rendered
+    assert "kairos_venue_max_book_age_ms 1500" in rendered
     assert "kairos_paper_unprotected_trades 0" in rendered
     assert "kairos_api_spend_month_usd 0.75" in rendered
 
