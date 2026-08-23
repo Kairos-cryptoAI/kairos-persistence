@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 authors = [{ name = "TheLitis" }]
 dependencies = [
     "asyncpg>=0.29,<1",
-    "kairos-core>=0.2,<0.3",
+    "kairos-core>=0.3,<0.4",
     "pydantic-settings>=2.2,<3",
     "structlog>=24.1,<27",
 ]
@@ -32,7 +32,7 @@ dev = [
 required-version = "==0.12.3"
 
 [tool.uv.sources]
-kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "c2b9ba192521f9843b245e1eae8a501d408a6bfa" }
+kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "c358e03b1218d5ec953dae3d10a96b32dd35aa4d" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["kairos_persistence"]
