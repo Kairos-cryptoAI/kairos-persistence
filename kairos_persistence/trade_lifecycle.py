@@ -53,6 +53,8 @@ _ALLOWED_TRANSITIONS: dict[TradeState, frozenset[TradeState]] = {
         {
             TradeState.PROTECTING,
             TradeState.ACTIVE,
+            TradeState.EXITING_STOP,
+            TradeState.EXITING_TARGET,
             TradeState.EXITING_EMERGENCY,
             TradeState.FAILED_BLOCKED,
         }

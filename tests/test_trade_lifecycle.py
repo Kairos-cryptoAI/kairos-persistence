@@ -191,6 +191,8 @@ def test_lifecycle_requires_protection_before_active_and_serializes_exit_choice(
     validate_trade_transition(TradeState.RECEIVED, TradeState.ENTRY_PENDING)
     validate_trade_transition(TradeState.ENTRY_PENDING, TradeState.PROTECTING)
     validate_trade_transition(TradeState.PROTECTING, TradeState.ACTIVE)
+    validate_trade_transition(TradeState.PROTECTING, TradeState.EXITING_STOP)
+    validate_trade_transition(TradeState.PROTECTING, TradeState.EXITING_TARGET)
     validate_trade_transition(TradeState.ACTIVE, TradeState.ACTIVE)
     validate_trade_transition(TradeState.ACTIVE, TradeState.EXITING_TIMEOUT)
     validate_trade_transition(TradeState.EXITING_TIMEOUT, TradeState.FLAT)
