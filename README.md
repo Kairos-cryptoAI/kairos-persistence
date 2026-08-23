@@ -127,6 +127,26 @@ reused with different content. Every transition also appends a domain-separated
 SHA-256 chained event. `recovery_required()` exposes unresolved effects so the
 execution service can reconcile them before accepting another order.
 
+PAPER effects carry an all-or-none `(environment, account_id, trade_id,
+order_role)` lineage. Recovery callers must pass `environment` and `account_id`
+together so a signing account never reconciles another account's venue effects.
+Legacy DRY_RUN effects remain readable with all four lineage fields absent.
+
+## PAPER trade lifecycle and recovery barrier
+
+`TradeLifecycleRepository` persists the strict `RiskTradeDecisionV1` payload,
+both the logical Binance symbol and immutable EVEDEX `venue_symbol`, deterministic
+entry/protection/exit order identifiers, cumulative fills and the timeout clock.
+The public state values come directly from `kairos-core`; each transition is
+serialized and appended to a per-trade SHA-256 chain. A `FAILED_BLOCKED` trade is
+intentionally non-terminal and continues to occupy the one-active-symbol slot.
+
+Startup calls `begin_recovery()` before any venue reconciliation. It returns a
+monotonic `recovery_epoch`; only `complete_recovery(expected_epoch=...)` for that
+same epoch may unblock entries. This prevents an older process that finishes late
+from clearing the barrier established by a newer restart. Day-start, peak and
+latest equity are updated atomically with a monotonic reconciliation sequence.
+
 ## Runtime metrics
 
 `kairos-persistence-exporter` exposes a small Prometheus endpoint without a

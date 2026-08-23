@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from enum import StrEnum
 from typing import Any
 
 import asyncpg
+from kairos_core.enums import OrderRole
 
 from .repository import MessageIdentityConflict
 from .runtime import canonical_payload
@@ -21,7 +23,11 @@ class EffectType(StrEnum):
     PLACE_ORDER = "PLACE_ORDER"
     CLOSE_POSITION = "CLOSE_POSITION"
     PROTECTIVE_STOP = "PROTECTIVE_STOP"
+    TAKE_PROFIT = "TAKE_PROFIT"
     CANCEL_ORDER = "CANCEL_ORDER"
+    CANCEL_TPSL = "CANCEL_TPSL"
+    TIMEOUT_CLOSE = "TIMEOUT_CLOSE"
+    EMERGENCY_CLOSE = "EMERGENCY_CLOSE"
     SET_LEVERAGE = "SET_LEVERAGE"
 
 
@@ -46,6 +52,10 @@ class ExecutionEffect:
     response_payload: dict[str, Any] | None
     error: str | None
     journal_head_sha256: str
+    environment: str | None = None
+    account_id: str | None = None
+    trade_id: str | None = None
+    order_role: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,9 +79,14 @@ class ExecutionJournalRepository:
         symbol: str,
         client_order_id: str | None,
         request_payload: dict[str, Any],
+        environment: str | None = None,
+        account_id: str | None = None,
+        trade_id: str | None = None,
+        order_role: str | None = None,
         recovery_delay: timedelta = timedelta(minutes=2),
     ) -> EffectPreparation:
         self._validate_identity(effect_key, exchange, symbol, client_order_id)
+        self._validate_lineage(environment, account_id, trade_id, order_role)
         if recovery_delay < timedelta(0):
             raise ValueError("recovery_delay must not be negative")
         _request_json, request_sha256 = canonical_payload(request_payload)
@@ -81,6 +96,10 @@ class ExecutionJournalRepository:
             "symbol": symbol,
             "client_order_id": client_order_id,
             "request_sha256": request_sha256,
+            "environment": environment,
+            "account_id": account_id,
+            "trade_id": trade_id,
+            "order_role": order_role,
         }
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -102,6 +121,10 @@ class ExecutionJournalRepository:
                         or effect.symbol != symbol
                         or effect.client_order_id != client_order_id
                         or effect.request_sha256 != request_sha256
+                        or effect.environment != environment
+                        or effect.account_id != account_id
+                        or effect.trade_id != trade_id
+                        or effect.order_role != order_role
                     ):
                         raise MessageIdentityConflict(
                             f"execution effect {effect_key!r} was reused with different immutable content"
@@ -112,8 +135,9 @@ class ExecutionJournalRepository:
                     """INSERT INTO execution_effects
                        (effect_key, effect_type, exchange, symbol, client_order_id,
                         request_sha256, request_payload, status, journal_head_sha256,
-                        recovery_after)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'PREPARED',$8,now()+$9::interval)
+                        recovery_after, environment, account_id, trade_id, order_role)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'PREPARED',$8,now()+$9::interval,
+                               $10,$11,$12,$13)
                        RETURNING *""",
                     effect_key,
                     effect_type.value,
@@ -124,6 +148,10 @@ class ExecutionJournalRepository:
                     self._json(request_payload),
                     event_sha256,
                     recovery_delay,
+                    environment,
+                    account_id,
+                    trade_id,
+                    order_role,
                 )
                 await self._append_event(
                     connection,
@@ -176,20 +204,52 @@ class ExecutionJournalRepository:
         row = await self.pool.fetchrow("SELECT * FROM execution_effects WHERE effect_key=$1", effect_key)
         return None if row is None else self._record(row)
 
-    async def recovery_required(self, *, exchange: str | None = None) -> list[ExecutionEffect]:
-        if exchange is None:
+    async def recovery_required(
+        self,
+        *,
+        exchange: str | None = None,
+        environment: str | None = None,
+        account_id: str | None = None,
+    ) -> list[ExecutionEffect]:
+        if (environment is None) != (account_id is None):
+            raise ValueError("recovery scope requires both environment and account_id")
+        if exchange is not None and not exchange.strip():
+            raise ValueError("exchange must be absent or non-empty")
+        if environment is not None and account_id is not None:
+            if not environment.strip() or not account_id.strip():
+                raise ValueError("environment and account_id must not be empty")
+        if exchange is None and environment is None:
             rows = await self.pool.fetch(
                 """SELECT * FROM execution_effects
                    WHERE status IN ('PREPARED','FAILED') AND recovery_after <= now()
                    ORDER BY prepared_at, effect_key"""
             )
-        else:
+        elif environment is None:
             rows = await self.pool.fetch(
                 """SELECT * FROM execution_effects
                    WHERE status IN ('PREPARED','FAILED') AND exchange=$1
                      AND recovery_after <= now()
                    ORDER BY prepared_at, effect_key""",
                 exchange,
+            )
+        elif exchange is None:
+            rows = await self.pool.fetch(
+                """SELECT * FROM execution_effects
+                   WHERE status IN ('PREPARED','FAILED')
+                     AND environment=$1 AND account_id=$2 AND recovery_after <= now()
+                   ORDER BY prepared_at, effect_key""",
+                environment,
+                account_id,
+            )
+        else:
+            rows = await self.pool.fetch(
+                """SELECT * FROM execution_effects
+                   WHERE status IN ('PREPARED','FAILED') AND exchange=$1
+                     AND environment=$2 AND account_id=$3 AND recovery_after <= now()
+                   ORDER BY prepared_at, effect_key""",
+                exchange,
+                environment,
+                account_id,
             )
         return [self._record(row) for row in rows]
 
@@ -328,6 +388,27 @@ class ExecutionJournalRepository:
             raise ValueError("client_order_id must be absent or non-empty")
 
     @staticmethod
+    def _validate_lineage(
+        environment: str | None,
+        account_id: str | None,
+        trade_id: str | None,
+        order_role: str | None,
+    ) -> None:
+        values = (environment, account_id, trade_id, order_role)
+        if all(value is None for value in values):
+            return
+        if any(value is None or not value.strip() for value in values):
+            raise ValueError("execution effect lineage must be complete or entirely absent")
+        if environment is None or account_id is None or trade_id is None:
+            raise RuntimeError("execution effect lineage validation did not narrow optional fields")
+        if not re.fullmatch(r"[0-9a-f]{64}", trade_id):
+            raise ValueError("execution effect trade_id must be a lowercase SHA-256")
+        try:
+            OrderRole(str(order_role))
+        except ValueError as exc:
+            raise ValueError("execution effect order_role is unknown") from exc
+
+    @staticmethod
     def _event_sha(
         effect_key: str,
         phase: EffectStatus,
@@ -368,6 +449,9 @@ class ExecutionJournalRepository:
 
     @classmethod
     def _record(cls, row: asyncpg.Record) -> ExecutionEffect:
+        request_payload = cls._object(row["request_payload"])
+        if canonical_payload(request_payload)[1] != row["request_sha256"]:
+            raise MessageIdentityConflict("stored execution request fingerprint does not match")
         return ExecutionEffect(
             effect_key=row["effect_key"],
             effect_type=EffectType(row["effect_type"]),
@@ -375,7 +459,7 @@ class ExecutionJournalRepository:
             symbol=row["symbol"],
             client_order_id=row["client_order_id"],
             request_sha256=row["request_sha256"],
-            request_payload=cls._object(row["request_payload"]),
+            request_payload=request_payload,
             status=EffectStatus(row["status"]),
             exchange_effect_id=row["exchange_effect_id"],
             response_payload=(
@@ -383,6 +467,10 @@ class ExecutionJournalRepository:
             ),
             error=row["error"],
             journal_head_sha256=row["journal_head_sha256"],
+            environment=row["environment"],
+            account_id=row["account_id"],
+            trade_id=row["trade_id"],
+            order_role=row["order_role"],
         )
 
     @staticmethod

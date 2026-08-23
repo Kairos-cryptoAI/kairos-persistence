@@ -25,6 +25,17 @@ from .source_state import (
     UsageReservation,
     UsageStatus,
 )
+from .trade_lifecycle import (
+    TERMINAL_TRADE_STATES,
+    EquityState,
+    NewTrade,
+    OrderRole,
+    RecoveryState,
+    TradeLifecycleRepository,
+    TradeRecord,
+    TradeState,
+    validate_trade_transition,
+)
 from .usage_budget import LLM_BUDGET_SERVICE, DurableLLMUsageBudget
 
 __all__ = [
@@ -50,4 +61,13 @@ __all__ = [
     "UsageStatus",
     "LLM_BUDGET_SERVICE",
     "canonical_payload",
+    "EquityState",
+    "NewTrade",
+    "OrderRole",
+    "RecoveryState",
+    "TERMINAL_TRADE_STATES",
+    "TradeLifecycleRepository",
+    "TradeRecord",
+    "TradeState",
+    "validate_trade_transition",
 ]

@@ -216,6 +216,9 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
     journal = ExecutionJournalRepository(database.pool)
     effect_key = f"evedex:PLACE_ORDER:{uuid4().hex}"
     request = {"symbol": "BTCUSDT", "quantity": 0.001, "side": "BUY"}
+    environment = "evedex-dev"
+    account_id = f"paper-{uuid4().hex}"
+    trade_id = hashlib.sha256(effect_key.encode()).hexdigest()
 
     try:
         first, duplicate = await asyncio.gather(
@@ -226,6 +229,10 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
                 symbol="BTCUSDT",
                 client_order_id="client-1",
                 request_payload=request,
+                environment=environment,
+                account_id=account_id,
+                trade_id=trade_id,
+                order_role="ENTRY",
                 recovery_delay=timedelta(0),
             ),
             journal.prepare(
@@ -235,6 +242,10 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
                 symbol="BTCUSDT",
                 client_order_id="client-1",
                 request_payload=request,
+                environment=environment,
+                account_id=account_id,
+                trade_id=trade_id,
+                order_role="ENTRY",
                 recovery_delay=timedelta(0),
             ),
         )
@@ -244,6 +255,22 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
         assert [item.effect_key for item in await journal.recovery_required(exchange="evedex")] == [
             effect_key
         ]
+        assert [
+            item.effect_key
+            for item in await journal.recovery_required(
+                exchange="evedex",
+                environment=environment,
+                account_id=account_id,
+            )
+        ] == [effect_key]
+        assert (
+            await journal.recovery_required(
+                exchange="evedex",
+                environment=environment,
+                account_id="different-paper-account",
+            )
+            == []
+        )
 
         confirmed = await journal.confirm(
             effect_key,
@@ -255,6 +282,21 @@ async def test_execution_effect_journal_is_idempotent_chained_and_recoverable() 
         assert reconciled.status is EffectStatus.RECONCILED
         assert await journal.recovery_required(exchange="evedex") == []
         assert await journal.verify_chain(effect_key)
+
+        await database.pool.execute(
+            """UPDATE execution_effects
+               SET request_payload=jsonb_set(request_payload,'{quantity}','0.002'::jsonb)
+               WHERE effect_key=$1""",
+            effect_key,
+        )
+        with pytest.raises(MessageIdentityConflict, match="fingerprint"):
+            await journal.get(effect_key)
+        await database.pool.execute(
+            """UPDATE execution_effects
+               SET request_payload=jsonb_set(request_payload,'{quantity}','0.001'::jsonb)
+               WHERE effect_key=$1""",
+            effect_key,
+        )
 
         with pytest.raises(MessageIdentityConflict):
             await journal.prepare(
