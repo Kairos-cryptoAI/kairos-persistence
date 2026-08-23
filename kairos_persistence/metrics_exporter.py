@@ -25,11 +25,72 @@ class RuntimeMetrics:
     execution_prepared: int
     execution_failed: int
     oldest_outbox_age_seconds: float
+    closed_bar_gaps_24h: int = 0
+    venue_measurements_24h: int = 0
+    venue_blocked_24h: int = 0
+    venue_p95_abs_basis_bps: float = 0.0
+    venue_p95_spread_bps: float = 0.0
+    venue_p95_slippage_bps: float = 0.0
+    latest_venue_age_seconds: float = 0.0
+    candidate_veto_24h: int = 0
+    candidate_defer_24h: int = 0
+    paper_active_trades: int = 0
+    paper_unprotected_trades: int = 0
+    paper_recovery_blocked: int = 0
+    execution_p95_shortfall_bps: float = 0.0
+    latest_paper_account_age_seconds: float = 0.0
+    api_spend_month_usd: float = 0.0
 
 
 RedisProbe = Callable[[str], Awaitable[bool]]
 
 _QUERY = """
+WITH closed_bars AS (
+    SELECT payload->>'symbol' AS symbol,
+           (payload->>'open_time_ms')::bigint AS open_time_ms
+      FROM event_audit
+     WHERE topic='kairos.market.closed_bar.v1'
+       AND produced_at >= now() - interval '24 hours'
+), sequenced_bars AS (
+    SELECT symbol, open_time_ms,
+           lag(open_time_ms) OVER (PARTITION BY symbol ORDER BY open_time_ms) AS previous_open_time_ms
+      FROM closed_bars
+), venue AS (
+    SELECT produced_at,
+           abs((payload->>'basis_bps')::double precision) AS abs_basis_bps,
+           (payload->>'spread_bps')::double precision AS spread_bps,
+           greatest(
+               (payload->>'buy_slippage_bps')::double precision,
+               (payload->>'sell_slippage_bps')::double precision
+           ) AS slippage_bps,
+           (payload->>'entry_allowed')::boolean AS entry_allowed
+      FROM event_audit
+     WHERE topic='kairos.venue.quality.v1'
+       AND produced_at >= now() - interval '24 hours'
+), decisions AS (
+    SELECT payload->>'trade_id' AS trade_id,
+           payload->'intent'->>'side' AS side,
+           (payload->>'worst_entry_price')::double precision AS decision_entry_price
+      FROM event_audit
+     WHERE topic='kairos.risk.trade_decision.v1'
+       AND payload->>'approved'='true'
+), entry_fills AS (
+    SELECT DISTINCT ON (payload->>'trade_id')
+           payload->>'trade_id' AS trade_id,
+           (payload->>'average_price')::double precision AS average_price
+      FROM event_audit
+     WHERE topic='kairos.execution.trade_event.v1'
+       AND payload->>'event_type' IN ('ENTRY_PARTIAL_FILL', 'ENTRY_FILLED')
+       AND payload->>'average_price' IS NOT NULL
+       AND produced_at >= now() - interval '24 hours'
+     ORDER BY payload->>'trade_id', produced_at DESC
+), shortfall AS (
+    SELECT abs(entry_fills.average_price - decisions.decision_entry_price)
+               / decisions.decision_entry_price * 10000 AS shortfall_bps
+      FROM entry_fills
+      JOIN decisions USING (trade_id)
+     WHERE decisions.decision_entry_price > 0
+)
 SELECT
     (SELECT count(*) FROM message_outbox
       WHERE published_at IS NULL AND dead_lettered_at IS NULL)::bigint AS outbox_pending,
@@ -41,7 +102,48 @@ SELECT
     (SELECT count(*) FROM execution_effects WHERE status = 'FAILED')::bigint AS execution_failed,
     COALESCE((SELECT EXTRACT(EPOCH FROM now() - min(created_at))
       FROM message_outbox WHERE published_at IS NULL AND dead_lettered_at IS NULL), 0)::double precision
-      AS oldest_outbox_age_seconds
+      AS oldest_outbox_age_seconds,
+    (SELECT count(*) FROM sequenced_bars
+      WHERE previous_open_time_ms IS NOT NULL
+        AND open_time_ms <> previous_open_time_ms + 60000)::bigint AS closed_bar_gaps_24h,
+    (SELECT count(*) FROM venue)::bigint AS venue_measurements_24h,
+    (SELECT count(*) FROM venue WHERE NOT entry_allowed)::bigint AS venue_blocked_24h,
+    COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY abs_basis_bps) FROM venue), 0)
+      ::double precision AS venue_p95_abs_basis_bps,
+    COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY spread_bps) FROM venue), 0)
+      ::double precision AS venue_p95_spread_bps,
+    COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY slippage_bps) FROM venue), 0)
+      ::double precision AS venue_p95_slippage_bps,
+    COALESCE((SELECT EXTRACT(EPOCH FROM now() - max(produced_at)) FROM venue), 0)
+      ::double precision AS latest_venue_age_seconds,
+    (SELECT count(*) FROM event_audit
+      WHERE topic='kairos.aggregator.review.v1'
+        AND payload->>'decision'='VETO'
+        AND produced_at >= now() - interval '24 hours')::bigint AS candidate_veto_24h,
+    (SELECT count(*) FROM event_audit
+      WHERE topic='kairos.aggregator.review.v1'
+        AND payload->>'decision'='DEFER'
+        AND produced_at >= now() - interval '24 hours')::bigint AS candidate_defer_24h,
+    (SELECT count(*) FROM execution_trades
+      WHERE trading_mode='PAPER' AND state NOT IN ('FLAT','CANCELLED'))::bigint
+      AS paper_active_trades,
+    (SELECT count(*) FROM execution_trades
+      WHERE trading_mode='PAPER'
+        AND filled_quantity > 0
+        AND stop_exchange_order_id IS NULL
+        AND state NOT IN ('FLAT','CANCELLED'))::bigint AS paper_unprotected_trades,
+    (SELECT count(*) FROM execution_recovery_state
+      WHERE entries_blocked)::bigint AS paper_recovery_blocked,
+    COALESCE((SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY shortfall_bps) FROM shortfall), 0)
+      ::double precision AS execution_p95_shortfall_bps,
+    COALESCE((SELECT EXTRACT(EPOCH FROM now() - max(produced_at))
+      FROM event_audit WHERE topic='kairos.account.snapshot.v2'), 0)::double precision
+      AS latest_paper_account_age_seconds,
+    COALESCE((SELECT sum(actual_cost_microusd)::double precision / 1000000
+      FROM source_usage_reservations
+      WHERE status='COMMITTED'
+        AND billing_month=date_trunc('month', CURRENT_DATE)::date), 0)::double precision
+      AS api_spend_month_usd
 """
 
 
@@ -107,6 +209,21 @@ async def collect_runtime_metrics(
         execution_prepared=int(row["execution_prepared"]),
         execution_failed=int(row["execution_failed"]),
         oldest_outbox_age_seconds=float(row["oldest_outbox_age_seconds"]),
+        closed_bar_gaps_24h=int(row["closed_bar_gaps_24h"]),
+        venue_measurements_24h=int(row["venue_measurements_24h"]),
+        venue_blocked_24h=int(row["venue_blocked_24h"]),
+        venue_p95_abs_basis_bps=float(row["venue_p95_abs_basis_bps"]),
+        venue_p95_spread_bps=float(row["venue_p95_spread_bps"]),
+        venue_p95_slippage_bps=float(row["venue_p95_slippage_bps"]),
+        latest_venue_age_seconds=float(row["latest_venue_age_seconds"]),
+        candidate_veto_24h=int(row["candidate_veto_24h"]),
+        candidate_defer_24h=int(row["candidate_defer_24h"]),
+        paper_active_trades=int(row["paper_active_trades"]),
+        paper_unprotected_trades=int(row["paper_unprotected_trades"]),
+        paper_recovery_blocked=int(row["paper_recovery_blocked"]),
+        execution_p95_shortfall_bps=float(row["execution_p95_shortfall_bps"]),
+        latest_paper_account_age_seconds=float(row["latest_paper_account_age_seconds"]),
+        api_spend_month_usd=float(row["api_spend_month_usd"]),
     )
 
 
@@ -159,6 +276,96 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
             "Age of the oldest unpublished outbox row.",
             "gauge",
             metrics.oldest_outbox_age_seconds,
+        ),
+        (
+            "kairos_closed_bar_gaps_24h",
+            "Gap or reorder boundaries in persisted one-minute bars over 24 hours.",
+            "gauge",
+            metrics.closed_bar_gaps_24h,
+        ),
+        (
+            "kairos_venue_measurements_24h",
+            "Persisted EVEDEX venue-quality measurements over 24 hours.",
+            "gauge",
+            metrics.venue_measurements_24h,
+        ),
+        (
+            "kairos_venue_blocked_24h",
+            "EVEDEX venue-quality measurements that denied entry over 24 hours.",
+            "gauge",
+            metrics.venue_blocked_24h,
+        ),
+        (
+            "kairos_venue_p95_abs_basis_bps",
+            "24-hour p95 absolute Binance-to-EVEDEX basis in basis points.",
+            "gauge",
+            metrics.venue_p95_abs_basis_bps,
+        ),
+        (
+            "kairos_venue_p95_spread_bps",
+            "24-hour p95 EVEDEX spread in basis points.",
+            "gauge",
+            metrics.venue_p95_spread_bps,
+        ),
+        (
+            "kairos_venue_p95_slippage_bps",
+            "24-hour p95 worst-side measured EVEDEX slippage in basis points.",
+            "gauge",
+            metrics.venue_p95_slippage_bps,
+        ),
+        (
+            "kairos_venue_latest_age_seconds",
+            "Age of the latest persisted venue-quality measurement.",
+            "gauge",
+            metrics.latest_venue_age_seconds,
+        ),
+        (
+            "kairos_candidate_veto_24h",
+            "Candidate reviews vetoed over 24 hours.",
+            "gauge",
+            metrics.candidate_veto_24h,
+        ),
+        (
+            "kairos_candidate_defer_24h",
+            "Candidate reviews deferred over 24 hours.",
+            "gauge",
+            metrics.candidate_defer_24h,
+        ),
+        (
+            "kairos_paper_active_trades",
+            "Non-terminal durable PAPER trades.",
+            "gauge",
+            metrics.paper_active_trades,
+        ),
+        (
+            "kairos_paper_unprotected_trades",
+            "Non-terminal filled PAPER trades without a reconciled stop order.",
+            "gauge",
+            metrics.paper_unprotected_trades,
+        ),
+        (
+            "kairos_paper_recovery_blocked",
+            "Execution environments with new PAPER entries blocked for recovery.",
+            "gauge",
+            metrics.paper_recovery_blocked,
+        ),
+        (
+            "kairos_execution_p95_shortfall_bps",
+            "24-hour p95 absolute entry execution shortfall in basis points.",
+            "gauge",
+            metrics.execution_p95_shortfall_bps,
+        ),
+        (
+            "kairos_paper_account_latest_age_seconds",
+            "Age of the latest persisted strict PAPER account snapshot.",
+            "gauge",
+            metrics.latest_paper_account_age_seconds,
+        ),
+        (
+            "kairos_api_spend_month_usd",
+            "Committed durable provider spend for the current billing month in USD.",
+            "gauge",
+            metrics.api_spend_month_usd,
         ),
     )
 

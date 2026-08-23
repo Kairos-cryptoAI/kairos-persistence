@@ -23,6 +23,7 @@ from kairos_persistence import (
     SourceStateRepository,
     UsageStatus,
 )
+from kairos_persistence.metrics_exporter import collect_runtime_metrics
 
 pytestmark = pytest.mark.integration
 
@@ -32,6 +33,31 @@ def _settings() -> PersistenceSettings:
     if not database_url:
         pytest.skip("KAIROS_PERSISTENCE_DATABASE_URL is required for integration tests")
     return PersistenceSettings(database_url=database_url)
+
+
+@pytest.mark.asyncio
+async def test_operations_query_covers_strict_paper_audit_and_lifecycle_tables() -> None:
+    database = Database(_settings())
+    await database.connect()
+    try:
+        await database.migrate()
+
+        async def redis_probe(_url: str) -> bool:
+            return True
+
+        metrics = await collect_runtime_metrics(
+            database.pool,
+            redis_url="redis://unused",
+            redis_probe=redis_probe,
+        )
+        assert metrics.persistence_up == 1
+        assert metrics.redis_up == 1
+        assert metrics.closed_bar_gaps_24h >= 0
+        assert metrics.paper_unprotected_trades >= 0
+        assert metrics.execution_p95_shortfall_bps >= 0
+        assert metrics.api_spend_month_usd >= 0
+    finally:
+        await database.close()
 
 
 @pytest.mark.asyncio
