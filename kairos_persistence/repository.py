@@ -394,18 +394,24 @@ class AuditRepository:
                            ORDER BY id
                            FOR UPDATE SKIP LOCKED
                            LIMIT $2
+                       ), claimed AS (
+                           UPDATE message_outbox AS outbox
+                           SET lease_owner=$1, lease_until=now()+$3::interval,
+                               publish_attempts=publish_attempts+1
+                           FROM candidates
+                           WHERE outbox.id=candidates.id
+                           RETURNING outbox.id, outbox.message_id, outbox.topic, outbox.payload,
+                                     outbox.payload_sha256, outbox.publish_attempts
                        )
-                       UPDATE message_outbox AS outbox
-                       SET lease_owner=$1, lease_until=now()+$3::interval,
-                           publish_attempts=publish_attempts+1
-                       FROM candidates
-                       WHERE outbox.id=candidates.id
-                       RETURNING outbox.id, outbox.message_id, outbox.topic, outbox.payload,
-                                 outbox.payload_sha256, outbox.publish_attempts""",
+                       SELECT * FROM claimed ORDER BY id""",
                     worker_id,
                     limit,
                     lease,
                 )
+        # PostgreSQL does not define the row order of UPDATE ... RETURNING.
+        # The SQL orders the claimed rows explicitly; sorting again here keeps
+        # publication causal even if a future driver/query rewrite loses that
+        # guarantee.
         return [
             OutboxRecord(
                 id=row["id"],
@@ -415,7 +421,7 @@ class AuditRepository:
                 payload_sha256=row["payload_sha256"],
                 publish_attempts=row["publish_attempts"],
             )
-            for row in rows
+            for row in sorted(rows, key=lambda row: row["id"])
         ]
 
     async def mark_published(self, row_id: int, worker_id: str) -> bool:

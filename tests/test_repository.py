@@ -133,6 +133,25 @@ class _FakePool:
         yield self.connection
 
 
+class _ClaimConnection:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.sql = ""
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction(self)  # type: ignore[arg-type]
+
+    async def fetch(self, sql: str, *params: Any) -> list[dict[str, Any]]:
+        self.sql = " ".join(sql.split())
+        return self.rows
+
+    def snapshot(self) -> dict[str, Any]:
+        return {}
+
+    def restore(self, state: dict[str, Any]) -> None:
+        del state
+
+
 @pytest.mark.asyncio
 async def test_append_event_uses_parameterized_insert_and_is_idempotent():
     pool = AsyncMock()
@@ -248,3 +267,32 @@ async def test_missing_complete_rolls_back_and_marks_message_failed():
 
     assert connection.inbox[("execution", "incoming-1")]["status"] == "FAILED"
     assert connection.outbox == {}
+
+
+@pytest.mark.asyncio
+async def test_claim_outbox_preserves_causal_id_order() -> None:
+    rows = [
+        {
+            "id": 12,
+            "message_id": "later",
+            "topic": "bars",
+            "payload": {"message_id": "later"},
+            "payload_sha256": "b" * 64,
+            "publish_attempts": 1,
+        },
+        {
+            "id": 11,
+            "message_id": "earlier",
+            "topic": "bars",
+            "payload": {"message_id": "earlier"},
+            "payload_sha256": "a" * 64,
+            "publish_attempts": 1,
+        },
+    ]
+    connection = _ClaimConnection(rows)
+    repo = AuditRepository(_FakePool(connection))  # type: ignore[arg-type]
+
+    claimed = await repo.claim_outbox("worker", limit=2)
+
+    assert [record.id for record in claimed] == [11, 12]
+    assert "SELECT * FROM claimed ORDER BY id" in connection.sql
