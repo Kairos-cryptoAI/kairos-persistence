@@ -102,7 +102,9 @@ class _Repository:
         topic: str,
         payload: str,
         payload_sha256: str,
+        producer: str,
     ) -> bool:
+        self.events.append(f"producer:{producer}")
         self.outbox.append((message_id, topic, payload, payload_sha256))
         return True
 

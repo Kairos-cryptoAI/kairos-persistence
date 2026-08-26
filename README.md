@@ -74,8 +74,11 @@ bus = DurableMessageBus(transport, service_name=settings.service_name)
 ```
 
 Producer-only publishes are also committed to the outbox before the dispatcher
-sends them. Dispatch workers use `FOR UPDATE SKIP LOCKED`, expiring leases,
-bounded exponential retry and a dead-letter terminal state. A process may crash
+sends them. Every row is bound to one logical producer, and only that producer's
+earliest unpublished row is leaseable. This intentionally serializes each
+producer stream so retries, replicas and `SKIP LOCKED` cannot overtake a causal
+predecessor. Dispatch workers also use expiring leases, bounded exponential
+retry and a dead-letter terminal state. A process may crash
 after Redis accepts a publish but before PostgreSQL records `published_at`; the
 row is then published again. This deliberate at-least-once boundary is safe
 because downstream inboxes reject a reused `message_id` with different topic or

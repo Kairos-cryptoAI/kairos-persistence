@@ -25,6 +25,7 @@ class InboxClaim:
 @dataclass(frozen=True)
 class OutboxRecord:
     id: int
+    producer: str
     message_id: str
     topic: str
     payload: dict[str, Any]
@@ -50,6 +51,7 @@ class InboxTransaction:
     claim: InboxClaim
     consumer: str
     message_id: str
+    outbox_producer: str
     _connection: asyncpg.Connection
     _completed: bool = False
 
@@ -78,6 +80,7 @@ class InboxTransaction:
             topic=topic,
             payload=payload,
             payload_sha256=payload_sha256,
+            producer=self.outbox_producer,
         )
 
     async def complete(self, result: dict[str, Any] | None = None) -> None:
@@ -274,6 +277,8 @@ class AuditRepository:
         topic: str,
         lease: timedelta = timedelta(minutes=2),
         payload_sha256: str | None = None,
+        *,
+        outbox_producer: str | None = None,
     ) -> AsyncIterator[InboxTransaction]:
         """Claim and process one message with atomic inbox/business/outbox writes.
 
@@ -295,7 +300,14 @@ class AuditRepository:
                     payload_sha256,
                     connection=connection,
                 )
-                unit = InboxTransaction(self, claim, consumer, message_id, connection)
+                unit = InboxTransaction(
+                    self,
+                    claim,
+                    consumer,
+                    message_id,
+                    outbox_producer or consumer,
+                    connection,
+                )
 
                 if not claim.claimed:
                     yield unit
@@ -329,19 +341,24 @@ class AuditRepository:
         topic: str,
         payload: str,
         payload_sha256: str,
+        producer: str,
     ) -> bool:
+        if not producer.strip():
+            raise ValueError("outbox producer must not be empty")
         status = await connection.execute(
-            """INSERT INTO message_outbox(message_id, topic, payload, payload_sha256)
-               VALUES ($1,$2,$3::jsonb,$4) ON CONFLICT (message_id) DO NOTHING""",
+            """INSERT INTO message_outbox(message_id, topic, payload, payload_sha256, producer)
+               VALUES ($1,$2,$3::jsonb,$4,$5) ON CONFLICT (message_id) DO NOTHING""",
             message_id,
             topic,
             payload,
             payload_sha256,
+            producer,
         )
         if status.endswith("1"):
             return True
         existing = await connection.fetchrow(
-            "SELECT topic, payload, payload_sha256 FROM message_outbox WHERE message_id=$1",
+            """SELECT topic, payload, payload_sha256, producer
+                 FROM message_outbox WHERE message_id=$1""",
             message_id,
         )
         existing_payload = None if existing is None else existing["payload"]
@@ -355,11 +372,12 @@ class AuditRepository:
         if (
             existing is None
             or existing["topic"] != topic
+            or existing["producer"] != producer
             or existing_encoded != payload
             or existing["payload_sha256"] not in (None, payload_sha256)
         ):
             raise MessageIdentityConflict(
-                f"outbox message_id {message_id!r} was reused with different topic or payload"
+                f"outbox message_id {message_id!r} was reused with different topic, payload, or producer"
             )
         if existing["payload_sha256"] is None:
             await connection.execute(
@@ -371,7 +389,7 @@ class AuditRepository:
 
     async def pending_outbox(self, limit: int = 100) -> list[asyncpg.Record]:
         return await self.pool.fetch(
-            """SELECT id, message_id, topic, payload FROM message_outbox
+            """SELECT id, producer, message_id, topic, payload FROM message_outbox
                WHERE published_at IS NULL ORDER BY id LIMIT $1""",
             limit,
         )
@@ -380,41 +398,57 @@ class AuditRepository:
         self,
         worker_id: str,
         *,
+        producer: str,
         limit: int = 100,
         lease: timedelta = timedelta(seconds=30),
     ) -> list[OutboxRecord]:
+        if not producer.strip():
+            raise ValueError("outbox producer must not be empty")
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 rows = await connection.fetch(
                     """WITH candidates AS (
-                           SELECT id FROM message_outbox
-                           WHERE published_at IS NULL AND dead_lettered_at IS NULL
-                             AND available_at <= now()
-                             AND (lease_until IS NULL OR lease_until < now())
-                           ORDER BY id
-                           FOR UPDATE SKIP LOCKED
-                           LIMIT $2
+                           SELECT outbox.id
+                             FROM message_outbox AS outbox
+                            WHERE outbox.producer=$4
+                              AND outbox.published_at IS NULL
+                              AND outbox.dead_lettered_at IS NULL
+                              AND outbox.available_at <= now()
+                              AND (outbox.lease_until IS NULL OR outbox.lease_until < now())
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                    FROM message_outbox AS prior
+                                   WHERE prior.producer=outbox.producer
+                                     AND prior.id < outbox.id
+                                     AND prior.published_at IS NULL
+                                     AND prior.dead_lettered_at IS NULL
+                              )
+                            ORDER BY outbox.id
+                            FOR UPDATE OF outbox SKIP LOCKED
+                            LIMIT LEAST($2, 1)
                        ), claimed AS (
                            UPDATE message_outbox AS outbox
                            SET lease_owner=$1, lease_until=now()+$3::interval,
                                publish_attempts=publish_attempts+1
                            FROM candidates
                            WHERE outbox.id=candidates.id
-                           RETURNING outbox.id, outbox.message_id, outbox.topic, outbox.payload,
-                                     outbox.payload_sha256, outbox.publish_attempts
+                           RETURNING outbox.id, outbox.producer, outbox.message_id,
+                                     outbox.topic, outbox.payload, outbox.payload_sha256,
+                                     outbox.publish_attempts
                        )
                        SELECT * FROM claimed ORDER BY id""",
                     worker_id,
                     limit,
                     lease,
+                    producer,
                 )
-        # PostgreSQL does not define the row order of UPDATE ... RETURNING.
-        # The SQL orders the claimed rows explicitly; sorting again here keeps
-        # publication causal even if a future driver/query rewrite loses that
-        # guarantee.
+        # One producer head is leased at a time.  An earlier retry therefore
+        # cannot be overtaken, and two replicas cannot publish adjacent causal
+        # messages concurrently.
         return [
             OutboxRecord(
                 id=row["id"],
+                producer=row["producer"],
                 message_id=row["message_id"],
                 topic=row["topic"],
                 payload=(json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]),

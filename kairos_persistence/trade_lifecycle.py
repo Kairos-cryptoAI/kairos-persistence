@@ -36,6 +36,7 @@ from .runtime import canonical_payload
 
 TERMINAL_TRADE_STATES = frozenset({TradeState.FLAT, TradeState.CANCELLED})
 TRADE_EXECUTION_EVENT_TOPIC = "kairos.execution.trade_event.v1"
+EXECUTION_OUTBOX_PRODUCER = "kairos-execution-engine"
 
 _ALLOWED_TRANSITIONS: dict[TradeState, frozenset[TradeState]] = {
     TradeState.RECEIVED: frozenset(
@@ -941,6 +942,7 @@ class TradeLifecycleRepository:
                 TRADE_EXECUTION_EVENT_TOPIC,
                 encoded,
                 fingerprint,
+                EXECUTION_OUTBOX_PRODUCER,
             )
             return event
 
@@ -992,6 +994,7 @@ class TradeLifecycleRepository:
             TRADE_EXECUTION_EVENT_TOPIC,
             encoded,
             fingerprint,
+            EXECUTION_OUTBOX_PRODUCER,
         )
         return event
 

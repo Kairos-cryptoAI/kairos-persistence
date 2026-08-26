@@ -136,6 +136,7 @@ class DurableMessageBus(MessageBus):
                     topic=topic,
                     payload=encoded,
                     payload_sha256=payload_sha256,
+                    producer=self.service_name,
                 )
         self._wake_dispatcher.set()
         return message_id
@@ -172,6 +173,7 @@ class DurableMessageBus(MessageBus):
                     topic,
                     lease=timedelta(seconds=self.settings.inbox_lease_s),
                     payload_sha256=payload_sha256,
+                    outbox_producer=self.service_name,
                 ) as transaction:
                     if not transaction.claim.claimed:
                         should_ack = transaction.claim.duplicate_completed
@@ -231,6 +233,7 @@ class DurableMessageBus(MessageBus):
         while not self._closing:
             records = await repository.claim_outbox(
                 self._worker_id,
+                producer=self.service_name,
                 limit=self.settings.outbox_batch_size,
                 lease=timedelta(seconds=self.settings.outbox_lease_s),
             )

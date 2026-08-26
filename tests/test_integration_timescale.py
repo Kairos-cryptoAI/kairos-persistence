@@ -341,13 +341,21 @@ async def test_outbox_leases_retry_and_complete_without_two_workers_owning_a_row
                 "integration.output",
                 payload,
                 payload_sha256,
+                "integration-producer",
             )
 
-        first = await repository.claim_outbox("worker-1", limit=1)
+        first = await repository.claim_outbox(
+            "worker-1", producer="integration-producer", limit=1
+        )
         assert len(first) == 1
         assert first[0].message_id == message_id
         assert first[0].publish_attempts == 1
-        assert await repository.claim_outbox("worker-2", limit=1) == []
+        assert (
+            await repository.claim_outbox(
+                "worker-2", producer="integration-producer", limit=1
+            )
+            == []
+        )
 
         assert await repository.fail_outbox(
             first[0].id,
@@ -356,7 +364,9 @@ async def test_outbox_leases_retry_and_complete_without_two_workers_owning_a_row
             retry_after=timedelta(0),
             max_attempts=3,
         )
-        second = await repository.claim_outbox("worker-2", limit=1)
+        second = await repository.claim_outbox(
+            "worker-2", producer="integration-producer", limit=1
+        )
         assert len(second) == 1
         assert second[0].publish_attempts == 2
         assert await repository.mark_published(second[0].id, "worker-2")

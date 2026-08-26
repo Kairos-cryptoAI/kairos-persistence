@@ -333,6 +333,7 @@ async def test_atomic_trade_mutations_roll_back_replay_and_audit_terminal_scope(
         topic: str,
         payload: str,
         payload_sha256: str,
+        producer: str,
     ) -> bool:
         await original_enqueue_outbox(
             audit,
@@ -341,6 +342,7 @@ async def test_atomic_trade_mutations_roll_back_replay_and_audit_terminal_scope(
             topic,
             payload,
             payload_sha256,
+            producer,
         )
         raise RuntimeError("injected failure after outbox insert")
 

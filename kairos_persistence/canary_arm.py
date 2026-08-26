@@ -20,6 +20,7 @@ from .runtime import canonical_payload
 
 CANARY_REVIEW_TOPIC = "kairos.aggregator.review.v1"
 CANARY_SOURCE = "kairos-paper-canary"
+CANARY_OUTBOX_PRODUCER = "kairos-risk-manager"
 CANARY_STRATEGY_ID = "technical-canary"
 CANARY_STRATEGY_REVISION = "1"
 CANARY_WEIGHT = 0.0025
@@ -167,6 +168,7 @@ class PaperCanaryArmRepository:
                     CANARY_REVIEW_TOPIC,
                     review_json,
                     review_sha,
+                    CANARY_OUTBOX_PRODUCER,
                 )
         return self._record(row)
 

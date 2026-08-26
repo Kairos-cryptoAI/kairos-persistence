@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -69,7 +70,7 @@ class _FakeConnection:
         if compact.startswith("SELECT status, topic, payload_sha256 FROM message_inbox"):
             row = self.inbox.get((params[0], params[1]))
             return None if row is None else row.copy()
-        if compact.startswith("SELECT topic, payload, payload_sha256 FROM message_outbox"):
+        if compact.startswith("SELECT topic, payload, payload_sha256, producer FROM message_outbox"):
             row = self.outbox.get(params[0])
             return None if row is None else row.copy()
         kind = _sql_kind(sql)
@@ -103,13 +104,14 @@ class _FakeConnection:
             self.business.append((sql, params))
             return "INSERT 0 1"
         if kind == "outbox":
-            message_id, topic, payload, payload_sha256 = params
+            message_id, topic, payload, payload_sha256, producer = params
             if message_id in self.outbox:
                 return "INSERT 0 0"
             self.outbox[message_id] = {
                 "topic": topic,
                 "payload": payload,
                 "payload_sha256": payload_sha256,
+                "producer": producer,
             }
             return "INSERT 0 1"
 
@@ -274,6 +276,7 @@ async def test_claim_outbox_preserves_causal_id_order() -> None:
     rows = [
         {
             "id": 12,
+            "producer": "quant",
             "message_id": "later",
             "topic": "bars",
             "payload": {"message_id": "later"},
@@ -282,6 +285,7 @@ async def test_claim_outbox_preserves_causal_id_order() -> None:
         },
         {
             "id": 11,
+            "producer": "quant",
             "message_id": "earlier",
             "topic": "bars",
             "payload": {"message_id": "earlier"},
@@ -292,7 +296,44 @@ async def test_claim_outbox_preserves_causal_id_order() -> None:
     connection = _ClaimConnection(rows)
     repo = AuditRepository(_FakePool(connection))  # type: ignore[arg-type]
 
-    claimed = await repo.claim_outbox("worker", limit=2)
+    claimed = await repo.claim_outbox("worker", producer="quant", limit=2)
 
     assert [record.id for record in claimed] == [11, 12]
     assert "SELECT * FROM claimed ORDER BY id" in connection.sql
+    assert "prior.producer=outbox.producer" in connection.sql
+    assert "LIMIT LEAST($2, 1)" in connection.sql
+
+
+@pytest.mark.asyncio
+async def test_outbox_identity_binds_the_logical_producer() -> None:
+    connection = _FakeConnection()
+    repo = AuditRepository(_FakePool(connection))  # type: ignore[arg-type]
+
+    assert await repo.enqueue_outbox(
+        connection, "outgoing-1", "bars", "{}", "a" * 64, "quant"
+    )
+    assert not await repo.enqueue_outbox(
+        connection, "outgoing-1", "bars", "{}", "a" * 64, "quant"
+    )
+    with pytest.raises(RuntimeError, match="producer"):
+        await repo.enqueue_outbox(
+            connection, "outgoing-1", "bars", "{}", "a" * 64, "other"
+        )
+    with pytest.raises(ValueError, match="producer"):
+        await repo.enqueue_outbox(
+            connection, "outgoing-2", "bars", "{}", "b" * 64, " "
+        )
+
+
+def test_outbox_producer_migration_is_fail_closed_and_order_aware() -> None:
+    migration = (
+        Path(__file__).parents[1]
+        / "kairos_persistence"
+        / "migrations"
+        / "012_outbox_producer_order.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "ALTER COLUMN producer SET NOT NULL" in migration
+    assert "message_outbox_producer_not_empty" in migration
+    assert "ON message_outbox(producer, available_at, id)" in migration
+    assert "kairos-paper-canary' THEN 'kairos-risk-manager" in migration
