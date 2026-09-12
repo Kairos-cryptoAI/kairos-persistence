@@ -309,28 +309,17 @@ async def test_outbox_identity_binds_the_logical_producer() -> None:
     connection = _FakeConnection()
     repo = AuditRepository(_FakePool(connection))  # type: ignore[arg-type]
 
-    assert await repo.enqueue_outbox(
-        connection, "outgoing-1", "bars", "{}", "a" * 64, "quant"
-    )
-    assert not await repo.enqueue_outbox(
-        connection, "outgoing-1", "bars", "{}", "a" * 64, "quant"
-    )
+    assert await repo.enqueue_outbox(connection, "outgoing-1", "bars", "{}", "a" * 64, "quant")
+    assert not await repo.enqueue_outbox(connection, "outgoing-1", "bars", "{}", "a" * 64, "quant")
     with pytest.raises(RuntimeError, match="producer"):
-        await repo.enqueue_outbox(
-            connection, "outgoing-1", "bars", "{}", "a" * 64, "other"
-        )
+        await repo.enqueue_outbox(connection, "outgoing-1", "bars", "{}", "a" * 64, "other")
     with pytest.raises(ValueError, match="producer"):
-        await repo.enqueue_outbox(
-            connection, "outgoing-2", "bars", "{}", "b" * 64, " "
-        )
+        await repo.enqueue_outbox(connection, "outgoing-2", "bars", "{}", "b" * 64, " ")
 
 
 def test_outbox_producer_migration_is_fail_closed_and_order_aware() -> None:
     migration = (
-        Path(__file__).parents[1]
-        / "kairos_persistence"
-        / "migrations"
-        / "012_outbox_producer_order.sql"
+        Path(__file__).parents[1] / "kairos_persistence" / "migrations" / "012_outbox_producer_order.sql"
     ).read_text(encoding="utf-8")
 
     assert "ALTER COLUMN producer SET NOT NULL" in migration
