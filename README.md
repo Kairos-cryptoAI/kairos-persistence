@@ -121,6 +121,14 @@ service containers may start concurrently. The database DSN must be provided
 through `KAIROS_PERSISTENCE_DATABASE_URL`; the development default is not a
 production credential.
 
+## Cumulative provider qualification budget
+
+Runtime and metered qualification share the immutable
+`kairos-dev-qualification-v1` campaign: OpenAI $12, DeepSeek $1, X $2 across
+all months and services. Missing historical adoption blocks paid calls.
+See [the explicit receipt/adoption procedure](docs/CAMPAIGN-BUDGET.md);
+neither tests nor deployment should silently assume zero prior spend.
+
 ## Exchange-effect journal
 
 `ExecutionJournalRepository` records each non-transactional venue mutation as

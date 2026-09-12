@@ -27,6 +27,9 @@ from .repository import (
 from .runtime import DurableMessageBus, canonical_payload
 from .runtime_health import ExecutionRuntimeHealth, ExecutionRuntimeHealthRepository
 from .source_state import (
+    CAMPAIGN_PROVIDER_CAPS,
+    QUALIFICATION_CAMPAIGN_ID,
+    CampaignSourceUsage,
     MonthlySourceUsage,
     SourceBudgetExceeded,
     SourceCursor,
@@ -46,9 +49,13 @@ from .trade_lifecycle import (
     TradeState,
     validate_trade_transition,
 )
-from .usage_budget import LLM_BUDGET_SERVICE, DurableLLMUsageBudget
+from .usage_budget import LLM_BUDGET_SERVICE, CampaignLLMUsageBudget, DurableLLMUsageBudget
 
 __all__ = [
+    "CAMPAIGN_PROVIDER_CAPS",
+    "QUALIFICATION_CAMPAIGN_ID",
+    "CampaignSourceUsage",
+    "CampaignLLMUsageBudget",
     "AuditRepository",
     "Database",
     "DurableMessageBus",

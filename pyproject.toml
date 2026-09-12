@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 kairos-persistence-exporter = "kairos_persistence.metrics_exporter:main"
+kairos-budget-adopt = "kairos_persistence.campaign_adoption:main"
 
 [dependency-groups]
 dev = [

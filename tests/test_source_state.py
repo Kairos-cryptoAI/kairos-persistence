@@ -49,7 +49,7 @@ def _reservation_row(**overrides: Any) -> dict[str, Any]:
 async def test_reservation_is_budgeted_before_a_paid_request() -> None:
     connection = AsyncMock()
     connection.transaction = lambda: _Context()
-    connection.fetchrow.side_effect = [None, _reservation_row()]
+    connection.fetchrow.side_effect = [None, None, _reservation_row()]
     connection.fetchval.return_value = 0
     repository = SourceStateRepository(_Pool(connection))  # type: ignore[arg-type]
 
@@ -66,7 +66,7 @@ async def test_reservation_is_budgeted_before_a_paid_request() -> None:
     assert reservation.status is UsageStatus.RESERVED
     assert reservation.reserved_cost_microusd == 50_000
     assert connection.execute.await_count == 1
-    assert connection.fetchrow.await_count == 2
+    assert connection.fetchrow.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -88,7 +88,7 @@ async def test_reservation_fails_closed_at_monthly_budget() -> None:
             requested_at=datetime(2026, 8, 18, tzinfo=UTC),
         )
 
-    assert connection.fetchrow.await_count == 1
+    assert connection.fetchrow.await_count == 2
 
 
 @pytest.mark.asyncio

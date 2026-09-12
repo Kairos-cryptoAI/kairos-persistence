@@ -13,10 +13,34 @@ from .repository import MessageIdentityConflict
 
 _MAX_CURSOR = 2**64 - 1
 _MAX_BIGINT = 2**63 - 1
+QUALIFICATION_CAMPAIGN_ID = "kairos-dev-qualification-v1"
+CAMPAIGN_PROVIDER_CAPS = {"openai": 12_000_000, "deepseek": 1_000_000, "x": 2_000_000}
+
+
+def _provider_source(source: str) -> str:
+    return "x" if source in ("x", "x-api", "x_api") else source
+
+
+def _provider_sources(source: str) -> list[str]:
+    return ["x", "x-api", "x_api"] if source == "x" else [source]
 
 
 class SourceBudgetExceeded(RuntimeError):
     """A reservation would cross the configured monthly provider budget."""
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignSourceUsage:
+    campaign_id: str
+    source: str
+    budget_microusd: int
+    historical_cost_microusd: int
+    committed_cost_microusd: int
+    reserved_cost_microusd: int
+
+    @property
+    def budgeted_cost_microusd(self) -> int:
+        return self.historical_cost_microusd + self.committed_cost_microusd + self.reserved_cost_microusd
 
 
 class UsageStatus(StrEnum):
@@ -74,8 +98,92 @@ class MonthlySourceUsage:
 class SourceStateRepository:
     """Persist monotonic source cursors and reserve paid API capacity atomically."""
 
-    def __init__(self, pool: asyncpg.Pool) -> None:
+    def __init__(self, pool: asyncpg.Pool, *, campaign_id: str | None = None) -> None:
         self.pool = pool
+        if campaign_id not in (None, QUALIFICATION_CAMPAIGN_ID):
+            raise ValueError("unknown qualification campaign")
+        self.campaign_id = campaign_id
+
+    async def register_campaign(
+        self,
+        *,
+        source: str,
+        budget_microusd: int,
+        historical_cost_microusd: int,
+        historical_evidence_sha256: str,
+    ) -> None:
+        """Explicitly adopt all old ledger rows plus reconciled off-ledger spend.
+
+        The operator supplies a receipt hash and conservative off-ledger cost
+        (including uncertain paid probes). No copying, monthly reset or implicit
+        zero-spend adoption occurs. Repeating identical registration is harmless;
+        changing the binding, receipt, debt or cap is forbidden.
+        """
+        if self.campaign_id is None:
+            raise ValueError("campaign identity is required for registration")
+        source = _provider_source(source)
+        self._positive_int(budget_microusd, "budget_microusd")
+        self._nonnegative_int(historical_cost_microusd, "historical_cost_microusd")
+        if source not in CAMPAIGN_PROVIDER_CAPS or budget_microusd > CAMPAIGN_PROVIDER_CAPS[source]:
+            raise ValueError("campaign provider budget exceeds the registered ceiling")
+        if historical_cost_microusd > _MAX_BIGINT:
+            raise ValueError("historical cost exceeds PostgreSQL BIGINT range")
+        if len(historical_evidence_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in historical_evidence_sha256
+        ):
+            raise ValueError("historical evidence must be a lowercase SHA-256")
+        expected = (self.campaign_id, budget_microusd, historical_cost_microusd, historical_evidence_sha256)
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "source-budget:" + source
+                )
+                row = await connection.fetchrow(
+                    "SELECT * FROM campaign_source_budgets WHERE source=$1 FOR UPDATE", source
+                )
+                if row is not None:
+                    actual = tuple(
+                        row[key]
+                        for key in (
+                            "campaign_id",
+                            "budget_microusd",
+                            "historical_cost_microusd",
+                            "historical_evidence_sha256",
+                        )
+                    )
+                    if actual != expected:
+                        raise MessageIdentityConflict("campaign adoption cannot be replaced or reset")
+                    return
+                await connection.execute(
+                    """INSERT INTO campaign_source_budgets
+                       (source, campaign_id, budget_microusd, historical_cost_microusd,
+                        historical_evidence_sha256) VALUES ($1,$2,$3,$4,$5)""",
+                    source,
+                    *expected,
+                )
+
+    async def campaign_usage(self, source: str) -> CampaignSourceUsage:
+        source = _provider_source(source)
+        row = await self.pool.fetchrow(
+            """SELECT b.*,
+                 COALESCE((SELECT sum(actual_cost_microusd) FROM source_usage_reservations
+                   WHERE source=ANY($2::text[]) AND status='COMMITTED'),0) AS committed_cost,
+                 COALESCE((SELECT sum(reserved_cost_microusd) FROM source_usage_reservations
+                   WHERE source=ANY($2::text[]) AND status='RESERVED'),0) AS reserved_cost
+               FROM campaign_source_budgets b WHERE b.source=$1""",
+            source,
+            _provider_sources(source),
+        )
+        if row is None or (self.campaign_id is not None and row["campaign_id"] != self.campaign_id):
+            raise SourceBudgetExceeded("durable campaign adoption is required before paid calls")
+        return CampaignSourceUsage(
+            campaign_id=row["campaign_id"],
+            source=source,
+            budget_microusd=int(row["budget_microusd"]),
+            historical_cost_microusd=int(row["historical_cost_microusd"]),
+            committed_cost_microusd=int(row["committed_cost"]),
+            reserved_cost_microusd=int(row["reserved_cost"]),
+        )
 
     async def get_cursor(self, service: str, source: str, cursor_key: str) -> SourceCursor | None:
         identity = self._identity(service, source, cursor_key)
@@ -155,13 +263,21 @@ class SourceStateRepository:
         reserved_cost = self._cost(reserved_units, unit_cost_microusd)
         requested = self._aware(requested_at or datetime.now(UTC))
         month = date(requested.year, requested.month, 1)
-        lock_key = "\x1f".join((service, source, month.isoformat()))
+        provider = _provider_source(source)
+        lock_key = "source-budget:" + provider
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     lock_key,
                 )
+                campaign = await connection.fetchrow(
+                    "SELECT * FROM campaign_source_budgets WHERE source=$1", provider
+                )
+                if self.campaign_id is not None and (
+                    campaign is None or campaign["campaign_id"] != self.campaign_id
+                ):
+                    raise SourceBudgetExceeded("durable campaign adoption is required before paid calls")
                 existing = await connection.fetchrow(
                     """SELECT * FROM source_usage_reservations
                        WHERE service=$1 AND source=$2 AND reservation_id=$3 FOR UPDATE""",
@@ -172,7 +288,7 @@ class SourceStateRepository:
                 if existing is not None:
                     reservation = self._reservation(existing)
                     if (
-                        reservation.billing_month != month
+                        (campaign is None and reservation.billing_month != month)
                         or reservation.reserved_units != reserved_units
                         or reservation.unit_cost_microusd != unit_cost_microusd
                     ):
@@ -180,9 +296,23 @@ class SourceStateRepository:
                             f"source usage reservation {reservation_id!r} was reused with different content"
                         )
                     return reservation
-                budgeted = int(
-                    await connection.fetchval(
-                        """SELECT COALESCE(sum(
+                if campaign is not None:
+                    budgeted = int(
+                        await connection.fetchval(
+                            """SELECT COALESCE(sum(CASE status
+                             WHEN 'COMMITTED' THEN actual_cost_microusd
+                             WHEN 'RESERVED' THEN reserved_cost_microusd ELSE 0 END),0)
+                           FROM source_usage_reservations WHERE source=ANY($1::text[])""",
+                            _provider_sources(provider),
+                        )
+                    ) + int(campaign["historical_cost_microusd"])
+                    limit = min(monthly_budget_microusd, int(campaign["budget_microusd"]))
+                    if budgeted + reserved_cost > limit:
+                        raise SourceBudgetExceeded("cumulative campaign provider budget would be exceeded")
+                else:
+                    budgeted = int(
+                        await connection.fetchval(
+                            """SELECT COALESCE(sum(
                              CASE status
                                WHEN 'COMMITTED' THEN actual_cost_microusd
                                WHEN 'RESERVED' THEN reserved_cost_microusd
@@ -190,12 +320,12 @@ class SourceStateRepository:
                              END), 0)
                            FROM source_usage_reservations
                            WHERE service=$1 AND source=$2 AND billing_month=$3""",
-                        service,
-                        source,
-                        month,
+                            service,
+                            source,
+                            month,
+                        )
                     )
-                )
-                if budgeted + reserved_cost > monthly_budget_microusd:
+                if campaign is None and budgeted + reserved_cost > monthly_budget_microusd:
                     raise SourceBudgetExceeded(
                         f"monthly {source} budget would be exceeded by the requested reservation"
                     )
