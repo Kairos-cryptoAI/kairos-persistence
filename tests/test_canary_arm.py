@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 
 import pytest
@@ -21,11 +20,8 @@ from kairos_core import (
     canonical_sha256,
 )
 
-from kairos_persistence import (
-    Database,
-    PaperCanaryArmRepository,
-    PersistenceSettings,
-)
+from kairos_persistence import PaperCanaryArmRepository
+from kairos_persistence.canary_session import CanarySlot, digest
 
 
 def _canary(
@@ -37,6 +33,8 @@ def _canary(
     instrument_content_sha256: str | None = None,
     instrument_reference: str | None = None,
     route_evidence_ids: tuple[str, ...] | None = None,
+    operational_slot: CanarySlot | None = None,
+    account_id: str = "paper-canary-test",
 ) -> tuple[CandidateReviewV1, StrategicAllocation]:
     eligible_ms = (now_ms // 60_000 + 1) * 60_000
     bar_sha256 = "e" * 64
@@ -85,7 +83,7 @@ def _canary(
         )
     evidence = tuple(evidence_items)
     metadata = {
-        "account_id": "paper-canary-test",
+        "account_id": account_id,
         "alpha_claim": "false",
         "canary_entry_order": "MARKETABLE_IOC_LIMIT",
         "canary_quantity": "0.05",
@@ -115,18 +113,18 @@ def _canary(
         side=Side.LONG,
         decision_ts_ms=eligible_ms - 1,
         entry_eligible_ts_ms=eligible_ms,
-        entry_expires_ts_ms=eligible_ms + 60_000,
+        entry_expires_ts_ms=eligible_ms + (operational_slot.entry_window_ms if operational_slot else 60_000),
         reference_price=100.0,
         signal_strength=0.0,
-        gross_reward_bps=200.0,
+        gross_reward_bps=operational_slot.target_distance_bps if operational_slot else 200.0,
         exit_plan=ExitPlanV1(
-            stop_price=99.0,
-            target_price=102.0,
-            max_holding_ms=120_000,
+            stop_price=100 - operational_slot.stop_distance_bps / 100 if operational_slot else 99.0,
+            target_price=100 + operational_slot.target_distance_bps / 100 if operational_slot else 102.0,
+            max_holding_ms=operational_slot.max_holding_ms if operational_slot else 120_000,
         ),
         provenance=StrategyProvenanceV1(
             strategy_code_sha256="a" * 64,
-            config_sha256="b" * 64,
+            config_sha256=digest(operational_slot.intent_config()) if operational_slot else "b" * 64,
             input_window_sha256="c" * 64,
             features_sha256="d" * 64,
             input_bar_sha256s=(bar_sha256,),
@@ -142,7 +140,7 @@ def _canary(
         correlation_id=intent.intent_id,
         causation_id=intent.message_id,
         routed_at_ms=eligible_ms - 1,
-        review_deadline_ms=eligible_ms + 60_000,
+        review_deadline_ms=eligible_ms + (operational_slot.entry_window_ms if operational_slot else 60_000),
         evidence_ids=route_evidence_ids or (bar_sha256, instrument_sha256),
     )
     review = CandidateReviewV1(
@@ -298,73 +296,11 @@ def test_canary_binding_rejects_tampered_bar_provenance_and_misaligned_rules() -
         )
 
 
-@pytest.mark.integration
 @pytest.mark.asyncio
-async def test_canary_arm_is_single_use_durable_and_exact_review_bound() -> None:
-    database_url = os.getenv("KAIROS_PERSISTENCE_DATABASE_URL")
-    if not database_url:
-        pytest.skip("KAIROS_PERSISTENCE_DATABASE_URL is required for integration tests")
-    database = Database(PersistenceSettings(database_url=database_url))
-    await database.connect()
-    await database.migrate()
-    repository = PaperCanaryArmRepository(database.pool)
-    now_ms = int(datetime.now(UTC).timestamp() * 1_000)
-    first_review, first_allocation = _canary(now_ms, symbol="BTCUSDT")
-    second_review, second_allocation = _canary(now_ms + 1, symbol="ETHUSDT")
-    unarmed_review, _ = _canary(now_ms + 2, symbol="SOLUSDT")
-    account_id = "paper-canary-test"
-    review_ids = [
-        first_review.message_id,
-        second_review.message_id,
-        unarmed_review.message_id,
-    ]
-    try:
-        await database.pool.execute("DELETE FROM paper_canary_arms WHERE account_id=$1", account_id)
-        await database.pool.execute("DELETE FROM message_outbox WHERE message_id=ANY($1::text[])", review_ids)
-        await database.pool.execute("DELETE FROM event_audit WHERE message_id=ANY($1::text[])", review_ids)
-
-        armed = await repository.arm(
-            account_id=account_id,
-            review=first_review,
-            allocation=first_allocation,
+async def test_legacy_unbounded_arm_is_refused_without_database_access() -> None:
+    # The old unbounded integration is superseded by the isolated session drill.
+    review, allocation = _canary(1_800_000_000_000)
+    with pytest.raises(ValueError, match="bounded canary session"):
+        await PaperCanaryArmRepository(None).arm(
+            account_id="paper-canary-test", review=review, allocation=allocation
         )
-        assert armed.status == "ARMED"
-        assert (
-            await database.pool.fetchval(
-                "SELECT count(*) FROM message_outbox WHERE message_id=$1",
-                first_review.message_id,
-            )
-            == 1
-        )
-        with pytest.raises(ValueError, match="already armed"):
-            await repository.arm(
-                account_id=account_id,
-                review=second_review,
-                allocation=second_allocation,
-            )
-
-        consumed = await repository.consume(
-            account_id=account_id,
-            review=first_review,
-        )
-        assert consumed is not None
-        assert consumed.status == "CONSUMED"
-        assert consumed.decided_at_ms is not None
-        replay = await repository.consume(
-            account_id=account_id,
-            review=first_review,
-        )
-        assert replay == consumed
-        assert await repository.consume(account_id=account_id, review=unarmed_review) is None
-
-        second = await repository.arm(
-            account_id=account_id,
-            review=second_review,
-            allocation=second_allocation,
-        )
-        assert second.status == "ARMED"
-    finally:
-        await database.pool.execute("DELETE FROM paper_canary_arms WHERE account_id=$1", account_id)
-        await database.pool.execute("DELETE FROM message_outbox WHERE message_id=ANY($1::text[])", review_ids)
-        await database.pool.execute("DELETE FROM event_audit WHERE message_id=ANY($1::text[])", review_ids)
-        await database.close()

@@ -15,6 +15,7 @@ import asyncpg
 from kairos_core.contracts import CandidateReviewV1, StrategicAllocation
 from kairos_core.enums import MarketRegime, ReviewDecision, Side
 
+from .canary_session import CanaryAdmissionError, CanarySessionRepository
 from .repository import AuditRepository, MessageIdentityConflict
 from .runtime import canonical_payload
 
@@ -74,6 +75,9 @@ class PaperCanaryArm:
     status: str
     expires_at: datetime
     decided_at_ms: int | None
+    session_id: str | None = None
+    attempt_id: str | None = None
+    session_expires_at: datetime | None = None
 
 
 class PaperCanaryArmRepository:
@@ -88,7 +92,11 @@ class PaperCanaryArmRepository:
         account_id: str,
         review: CandidateReviewV1,
         allocation: StrategicAllocation,
+        session_id: str | None = None,
+        slot_id: str | None = None,
     ) -> PaperCanaryArm:
+        if not session_id or not slot_id:
+            raise CanaryAdmissionError("a verified bounded canary session and slot are required")
         self._validate_account(account_id)
         self._validate_binding(review, allocation)
         self._validate_account_binding(account_id, review)
@@ -161,6 +169,19 @@ class PaperCanaryArmRepository:
                         review_sha=review_sha,
                         allocation_sha=allocation_sha,
                     )
+                    binding = await connection.fetchval(
+                        "SELECT attempt_id FROM paper_canary_attempts WHERE arm_id=$1", arm_id
+                    )
+                    if binding is None:
+                        raise CanaryAdmissionError("historical unbound arms cannot acquire session authority")
+                await CanarySessionRepository.reserve_attempt(
+                    connection,
+                    session_id=session_id,
+                    slot_id=slot_id,
+                    account_id=account_id,
+                    arm_id=arm_id,
+                    review=review,
+                )
                 await audit.append_event(CANARY_REVIEW_TOPIC, review, connection=connection)
                 await audit.enqueue_outbox(
                     connection,
@@ -170,6 +191,7 @@ class PaperCanaryArmRepository:
                     review_sha,
                     CANARY_OUTBOX_PRODUCER,
                 )
+                row = await self._bound_row(connection, arm_id)
         return self._record(row)
 
     async def consume(
@@ -199,6 +221,18 @@ class PaperCanaryArmRepository:
                 if row["status"] == "EXPIRED":
                     return None
                 database_now = await connection.fetchval("SELECT clock_timestamp()")
+                binding = await connection.fetchrow(
+                    """SELECT a.attempt_id,a.session_id,s.entry_deadline_at,s.state
+                       FROM paper_canary_attempts a JOIN paper_canary_sessions s USING(session_id)
+                       WHERE a.arm_id=$1 FOR UPDATE OF s""",
+                    row["arm_id"],
+                )
+                if (
+                    binding is None
+                    or binding["state"] not in {"ARMED", "RUNNING"}
+                    or database_now >= binding["entry_deadline_at"]
+                ):
+                    return None
                 if row["status"] == "ARMED" and row["expires_at"] < database_now:
                     await connection.execute(
                         "UPDATE paper_canary_arms SET status='EXPIRED' WHERE arm_id=$1",
@@ -221,16 +255,32 @@ class PaperCanaryArmRepository:
                     )
                     if row is None:
                         raise RuntimeError("manual canary authorization lost its row lock")
+                    await connection.execute(
+                        "UPDATE paper_canary_attempts SET state='CONSUMED' WHERE arm_id=$1 AND state='ARMED'",
+                        row["arm_id"],
+                    )
+                    await connection.execute(
+                        """UPDATE paper_canary_sessions SET last_progress_at=clock_timestamp()
+                           WHERE session_id=$1""",
+                        binding["session_id"],
+                    )
+                row = await self._bound_row(connection, row["arm_id"])
                 return self._record(row)
 
     async def get(self, arm_id: str) -> PaperCanaryArm | None:
         if not arm_id or arm_id != arm_id.strip():
             raise ValueError("arm_id must be a normalized non-empty string")
-        row = await self.pool.fetchrow(
-            "SELECT * FROM paper_canary_arms WHERE arm_id=$1",
+        row = await self._bound_row(self.pool, arm_id)
+        return None if row is None else self._record(row)
+
+    @staticmethod
+    async def _bound_row(connection: Any, arm_id: str) -> Any:
+        return await connection.fetchrow(
+            """SELECT arm.*,a.session_id,a.attempt_id,s.entry_deadline_at AS session_expires_at
+               FROM paper_canary_arms arm LEFT JOIN paper_canary_attempts a USING(arm_id)
+               LEFT JOIN paper_canary_sessions s USING(session_id) WHERE arm.arm_id=$1""",
             arm_id,
         )
-        return None if row is None else self._record(row)
 
     @staticmethod
     async def _account_xact_lock(
@@ -476,6 +526,9 @@ class PaperCanaryArmRepository:
             status=row["status"],
             expires_at=row["expires_at"],
             decided_at_ms=row["decided_at_ms"],
+            session_id=row.get("session_id"),
+            attempt_id=row.get("attempt_id"),
+            session_expires_at=row.get("session_expires_at"),
         )
 
     @staticmethod
