@@ -17,6 +17,11 @@ from .mutation_budget import (
     ExecutionMutationBudgetRepository,
     ExecutionMutationReservation,
 )
+from .offline_outbox_drain import (
+    OfflineOutboxDrainResult,
+    OfflineOutboxDrainState,
+    OfflineOutboxPrefixDrainer,
+)
 from .offline_outbox_reconciler import (
     OfflineOutboxReconciler,
     OfflineOutboxReconciliationResult,
@@ -106,6 +111,9 @@ __all__ = [
     "OfflineOutboxReconciler",
     "OfflineOutboxReconciliationResult",
     "OfflineOutboxReconciliationState",
+    "OfflineOutboxDrainResult",
+    "OfflineOutboxDrainState",
+    "OfflineOutboxPrefixDrainer",
     "OutboxRecord",
     "OfflineDurableWriter",
     "OfflineWriterError",

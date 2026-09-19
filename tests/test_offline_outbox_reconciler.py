@@ -53,6 +53,7 @@ def _row(**overrides: Any) -> dict[str, Any]:
         "published_at": None,
         "dead_lettered_at": None,
         "lease_expired": True,
+        "lease_clear": False,
         "available": True,
         "reconciliation_state": "NONE",
     }
@@ -241,6 +242,34 @@ async def test_exact_claim_rejects_a_lost_update_race_without_publishing() -> No
 
     assert result.state is OfflineOutboxClaimState.REJECTED
     assert result.rejection is OfflineOutboxClaimRejection.RACE_LOST
+
+
+@pytest.mark.asyncio
+async def test_ready_exact_claim_requires_an_unleased_verified_producer_head() -> None:
+    connection = _ExactClaimConnection(row=_row(lease_expired=False, lease_clear=True))
+    repository = AuditRepository(_Pool(connection))  # type: ignore[arg-type]
+
+    result = await repository.claim_ready_outbox_exact(_identity(), reconciliation_id="drain-approval-1")
+
+    assert result.state is OfflineOutboxClaimState.CLAIMED
+    assert result.claim is not None
+    assert result.claim.claimed_publish_attempts == 4
+    calls = "\n".join(sql for _method, sql, _params in connection.calls)
+    assert "(lease_until IS NULL) AS lease_clear" in calls
+    assert "lease_until IS NULL" in calls
+    assert "reconciliation_state='PUBLISHING'" in calls
+
+
+@pytest.mark.asyncio
+async def test_ready_exact_claim_refuses_an_active_or_expired_lease() -> None:
+    connection = _ExactClaimConnection(row=_row(lease_clear=False))
+    repository = AuditRepository(_Pool(connection))  # type: ignore[arg-type]
+
+    result = await repository.claim_ready_outbox_exact(_identity(), reconciliation_id="drain-approval-1")
+
+    assert result.state is OfflineOutboxClaimState.REJECTED
+    assert result.rejection is OfflineOutboxClaimRejection.LEASE_PRESENT
+    assert not any(method == "fetchrow" and sql.startswith("UPDATE") for method, sql, _ in connection.calls)
 
 
 def test_normal_dispatcher_cannot_claim_reconciliation_rows() -> None:

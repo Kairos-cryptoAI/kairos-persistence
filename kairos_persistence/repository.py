@@ -51,6 +51,7 @@ class OfflineOutboxClaimRejection(StrEnum):
     ALREADY_PUBLISHED = "ALREADY_PUBLISHED"
     DEAD_LETTERED = "DEAD_LETTERED"
     LEASE_NOT_EXPIRED = "LEASE_NOT_EXPIRED"
+    LEASE_PRESENT = "LEASE_PRESENT"
     NOT_YET_AVAILABLE = "NOT_YET_AVAILABLE"
     RECONCILIATION_NOT_CLEAR = "RECONCILIATION_NOT_CLEAR"
     EARLIER_UNPUBLISHED_PREDECESSOR = "EARLIER_UNPUBLISHED_PREDECESSOR"
@@ -593,8 +594,11 @@ class AuditRepository:
         identity: OfflineOutboxIdentity,
         audit_rows: list[asyncpg.Record] | list[dict[str, Any]],
         has_unpublished_predecessor: bool,
+        lease_requirement: str = "expired",
     ) -> OfflineOutboxClaimRejection | None:
         """Validate all recovery invariants before an external publish is possible."""
+        if lease_requirement not in {"expired", "clear"}:
+            raise ValueError("offline outbox lease requirement must be expired or clear")
         if row is None:
             return OfflineOutboxClaimRejection.NOT_FOUND
         if any(
@@ -613,8 +617,10 @@ class AuditRepository:
             return OfflineOutboxClaimRejection.ALREADY_PUBLISHED
         if row["dead_lettered_at"] is not None:
             return OfflineOutboxClaimRejection.DEAD_LETTERED
-        if not row["lease_expired"]:
+        if lease_requirement == "expired" and not row["lease_expired"]:
             return OfflineOutboxClaimRejection.LEASE_NOT_EXPIRED
+        if lease_requirement == "clear" and not row["lease_clear"]:
+            return OfflineOutboxClaimRejection.LEASE_PRESENT
         if not row["available"]:
             return OfflineOutboxClaimRejection.NOT_YET_AVAILABLE
         if row["reconciliation_state"] != "NONE":
@@ -741,6 +747,121 @@ class AuditRepository:
                            AND dead_lettered_at IS NULL
                            AND available_at <= now()
                            AND lease_until < now()
+                           AND reconciliation_state='NONE'
+                     RETURNING publish_attempts""",
+                    reconciliation_id,
+                    lease,
+                    identity.id,
+                    identity.producer,
+                    identity.message_id,
+                    identity.topic,
+                    identity.payload_sha256,
+                    identity.publish_attempts,
+                )
+                if claimed is None:
+                    return OfflineOutboxClaimResult(
+                        state=OfflineOutboxClaimState.REJECTED,
+                        rejection=OfflineOutboxClaimRejection.RACE_LOST,
+                    )
+                payload, _sha256 = self._canonical_outbox_payload(row["payload"])
+                return OfflineOutboxClaimResult(
+                    state=OfflineOutboxClaimState.CLAIMED,
+                    claim=OfflineOutboxClaim(
+                        identity=identity,
+                        payload=payload,
+                        reconciliation_id=reconciliation_id,
+                        claimed_publish_attempts=claimed["publish_attempts"],
+                    ),
+                )
+
+    async def claim_ready_outbox_exact(
+        self,
+        identity: OfflineOutboxIdentity,
+        *,
+        reconciliation_id: str,
+        lease: timedelta = timedelta(minutes=5),
+    ) -> OfflineOutboxClaimResult:
+        """Claim one exact, unleased producer head for a signed prefix drain.
+
+        This deliberately does *not* reclaim an expired ordinary-dispatch
+        lease.  An expired lease has an ambiguous delivery history and must go
+        through the separately authorized one-row reconciliation procedure.
+        The claimed row enters ``PUBLISHING`` before the caller can reach its
+        transport; a crash or uncertain ACK therefore remains fail-closed
+        rather than returning to the normal dispatcher.
+        """
+        reconciliation_id = self._require_reconciliation_id(reconciliation_id)
+        if not isinstance(lease, timedelta) or not timedelta(0) < lease <= timedelta(minutes=5):
+            raise ValueError("offline exact outbox lease must be greater than zero and at most five minutes")
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"offline-outbox-reconciliation:{identity.id}",
+                )
+                row = await connection.fetchrow(
+                    """SELECT id, producer, message_id, topic, payload, payload_sha256,
+                              publish_attempts, published_at, dead_lettered_at,
+                              (lease_until IS NULL) AS lease_clear,
+                              (available_at <= now()) AS available, reconciliation_state
+                         FROM message_outbox
+                        WHERE id=$1
+                        FOR UPDATE""",
+                    identity.id,
+                )
+                audit_rows = await connection.fetch(
+                    """SELECT topic, payload
+                         FROM event_audit
+                        WHERE message_id=$1
+                        FOR UPDATE""",
+                    identity.message_id,
+                )
+                predecessor = await connection.fetchrow(
+                    """SELECT id
+                         FROM message_outbox
+                        WHERE producer=$1
+                          AND id < $2
+                          AND published_at IS NULL
+                          AND dead_lettered_at IS NULL
+                        ORDER BY id
+                        LIMIT 1
+                        FOR UPDATE""",
+                    identity.producer,
+                    identity.id,
+                )
+                rejection = self._validate_exact_offline_outbox(
+                    row,
+                    identity=identity,
+                    audit_rows=audit_rows,
+                    has_unpublished_predecessor=predecessor is not None,
+                    lease_requirement="clear",
+                )
+                if rejection is not None:
+                    return OfflineOutboxClaimResult(
+                        state=OfflineOutboxClaimState.REJECTED,
+                        rejection=rejection,
+                    )
+                claimed = await connection.fetchrow(
+                    """UPDATE message_outbox
+                           SET lease_owner=$1,
+                               lease_until=now()+$2::interval,
+                               publish_attempts=publish_attempts+1,
+                               reconciliation_state='PUBLISHING',
+                               reconciliation_id=$1,
+                               reconciliation_started_at=now(),
+                               reconciliation_outcome_at=NULL,
+                               last_error=NULL
+                         WHERE id=$3
+                           AND producer=$4
+                           AND message_id=$5
+                           AND topic=$6
+                           AND payload_sha256=$7
+                           AND publish_attempts=$8
+                           AND published_at IS NULL
+                           AND dead_lettered_at IS NULL
+                           AND available_at <= now()
+                           AND lease_until IS NULL
                            AND reconciliation_state='NONE'
                      RETURNING publish_attempts""",
                     reconciliation_id,
