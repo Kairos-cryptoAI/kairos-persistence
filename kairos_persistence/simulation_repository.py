@@ -998,9 +998,7 @@ class SimulationRepository:
                ORDER BY prepared_at, command_id""",
             session_id,
         )
-        commands = tuple(
-            self._stored_model(row, SimulationCommandV1, "simulation command") for row in rows
-        )
+        commands = tuple(self._stored_model(row, SimulationCommandV1, "simulation command") for row in rows)
         if any(command.session_id != session_id for command in commands):
             raise MessageIdentityConflict("prepared simulation command differs from requested session")
         return commands
