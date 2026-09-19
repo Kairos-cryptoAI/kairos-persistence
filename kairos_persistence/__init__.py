@@ -17,6 +17,7 @@ from .mutation_budget import (
     ExecutionMutationBudgetRepository,
     ExecutionMutationReservation,
 )
+from .offline_writer import OfflineDurableWriter, OfflineWriterError
 from .repository import (
     AuditRepository,
     InboxClaim,
@@ -76,6 +77,8 @@ __all__ = [
     "InboxTransaction",
     "MessageIdentityConflict",
     "OutboxRecord",
+    "OfflineDurableWriter",
+    "OfflineWriterError",
     "PaperCanaryArm",
     "PaperCanaryArmRepository",
     "PersistenceSettings",

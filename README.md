@@ -84,6 +84,23 @@ row is then published again. This deliberate at-least-once boundary is safe
 because downstream inboxes reject a reused `message_id` with different topic or
 SHA-256 payload and suppress exact completed duplicates.
 
+## Offline maintenance writer
+
+`OfflineDurableWriter` is deliberately narrower than `DurableMessageBus` for a
+pre-approved repair of an already stopped producer. It owns no transport and
+therefore never starts an outbox dispatcher, does not call `Database.migrate()`,
+and holds both the durable producer advisory lease and the schema-migration lock
+for its entire session. It first verifies an explicit database identity and the
+exact immutable migration profile supplied by the caller. A drifted schema,
+active migration or active producer fails before a write.
+
+Each `append()` writes the audit fact and matching producer-scoped outbox row in
+one transaction. Unlike the historical composite audit key, it also verifies
+that a deterministic `message_id` names exactly one topic and canonical payload
+across the whole audit log. Exact duplicates are idempotent; an identity conflict
+rolls back the transaction. It is intended for bounded offline maintenance only,
+never as a substitute for a running service or a way to dispatch a backlog.
+
 ## Atomic inbox/business/outbox processing
 
 `AuditRepository.message_transaction()` owns one pooled connection and one

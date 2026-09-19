@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections.abc import AsyncIterator
@@ -167,6 +168,96 @@ class AuditRepository:
             json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
         )
         return result.endswith("1")
+
+    @staticmethod
+    def _require_matching_audit_identity(
+        rows: list[asyncpg.Record] | list[dict[str, Any]],
+        *,
+        message_id: str,
+        topic: str,
+        canonical_json: str,
+    ) -> None:
+        """Reject a stable ID that does not name exactly one immutable audit payload."""
+        if len(rows) != 1:
+            raise MessageIdentityConflict(
+                f"event audit message_id {message_id!r} does not identify exactly one immutable payload"
+            )
+        row = rows[0]
+        stored_payload = row["payload"]
+        if isinstance(stored_payload, str):
+            try:
+                stored_payload = json.loads(stored_payload)
+            except json.JSONDecodeError as exc:
+                raise MessageIdentityConflict(
+                    f"event audit message_id {message_id!r} has an unreadable payload"
+                ) from exc
+        try:
+            stored_json = json.dumps(
+                stored_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise MessageIdentityConflict(
+                f"event audit message_id {message_id!r} has a non-canonical payload"
+            ) from exc
+        if row["topic"] != topic or stored_json != canonical_json:
+            raise MessageIdentityConflict(
+                f"event audit message_id {message_id!r} was reused with different topic or payload"
+            )
+
+    async def append_payload_strict(
+        self,
+        topic: str,
+        payload: dict[str, Any],
+        canonical_json: str,
+        payload_sha256: str,
+        *,
+        connection: asyncpg.Connection,
+    ) -> bool:
+        """Append a payload only when its globally stable ID has one exact meaning.
+
+        ``event_audit`` historically keys rows by ``(produced_at, message_id)``.
+        Offline repair needs a stronger invariant: one deterministic message ID
+        must map to one topic and canonical payload across the whole audit log.
+        The caller holds its producer lease and one transaction while it pairs
+        this fact with the matching outbox row.
+        """
+        message_id = payload.get("message_id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("durable payload requires a non-empty message_id")
+        if (
+            not isinstance(canonical_json, str)
+            or not isinstance(payload_sha256, str)
+            or hashlib.sha256(canonical_json.encode("utf-8")).hexdigest() != payload_sha256
+        ):
+            raise ValueError("durable payload canonical identity is invalid")
+        rows = await connection.fetch(
+            """SELECT topic, payload FROM event_audit
+                 WHERE message_id=$1 FOR UPDATE""",
+            message_id,
+        )
+        if rows:
+            self._require_matching_audit_identity(
+                rows, message_id=message_id, topic=topic, canonical_json=canonical_json
+            )
+            return False
+        inserted = await self.append_payload(topic, payload, connection=connection)
+        if inserted:
+            return True
+        # A direct writer may have inserted the composite primary key between
+        # the identity read and insert. Never assume that conflict is benign.
+        rows = await connection.fetch(
+            """SELECT topic, payload FROM event_audit
+                 WHERE message_id=$1 FOR UPDATE""",
+            message_id,
+        )
+        self._require_matching_audit_identity(
+            rows, message_id=message_id, topic=topic, canonical_json=canonical_json
+        )
+        return False
 
     async def claim_message(
         self,
