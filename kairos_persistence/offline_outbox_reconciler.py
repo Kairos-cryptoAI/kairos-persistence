@@ -80,13 +80,15 @@ class OfflineOutboxReconciler:
             reconciliation_id=reconciliation_id,
         )
         if claim_result.state is OfflineOutboxClaimState.REJECTED:
-            assert claim_result.rejection is not None
+            if claim_result.rejection is None:
+                raise RuntimeError("offline outbox repository returned a rejected claim without a reason")
             return OfflineOutboxReconciliationResult(
                 state=OfflineOutboxReconciliationState.CLAIM_REJECTED,
                 identity=identity,
                 rejection=claim_result.rejection,
             )
-        assert claim_result.claim is not None
+        if claim_result.claim is None:
+            raise RuntimeError("offline outbox repository returned a claimed result without a row")
         claim = claim_result.claim
         try:
             await publisher(claim.identity.topic, claim.payload)
