@@ -27,6 +27,12 @@ from .repository import (
 )
 from .runtime import DurableMessageBus, canonical_payload
 from .runtime_health import ExecutionRuntimeHealth, ExecutionRuntimeHealthRepository
+from .simulation_repository import (
+    SimulationCommandCompletion,
+    SimulationCommandPreparation,
+    SimulationJournalRepository,
+    SimulationRepository,
+)
 from .source_state import (
     CAMPAIGN_PROVIDER_CAPS,
     QUALIFICATION_CAMPAIGN_ID,
@@ -68,6 +74,10 @@ __all__ = [
     "ExecutionJournalRepository",
     "ExecutionRuntimeHealth",
     "ExecutionRuntimeHealthRepository",
+    "SimulationRepository",
+    "SimulationJournalRepository",
+    "SimulationCommandPreparation",
+    "SimulationCommandCompletion",
     "ExecutionMutationBudgetRepository",
     "ExecutionMutationReservation",
     "DEFAULT_COMPENSATION_RESERVE",
