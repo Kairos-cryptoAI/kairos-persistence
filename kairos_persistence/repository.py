@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from types import TracebackType
 from typing import Any
 
@@ -32,6 +34,89 @@ class OutboxRecord:
     payload: dict[str, Any]
     payload_sha256: str | None
     publish_attempts: int
+
+
+class OfflineOutboxClaimState(StrEnum):
+    """Result of a deliberately narrow offline outbox claim."""
+
+    CLAIMED = "CLAIMED"
+    REJECTED = "REJECTED"
+
+
+class OfflineOutboxClaimRejection(StrEnum):
+    """Fail-closed reasons an exact offline outbox claim was not made."""
+
+    NOT_FOUND = "NOT_FOUND"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    ALREADY_PUBLISHED = "ALREADY_PUBLISHED"
+    DEAD_LETTERED = "DEAD_LETTERED"
+    LEASE_NOT_EXPIRED = "LEASE_NOT_EXPIRED"
+    NOT_YET_AVAILABLE = "NOT_YET_AVAILABLE"
+    RECONCILIATION_NOT_CLEAR = "RECONCILIATION_NOT_CLEAR"
+    EARLIER_UNPUBLISHED_PREDECESSOR = "EARLIER_UNPUBLISHED_PREDECESSOR"
+    PAYLOAD_HASH_MISMATCH = "PAYLOAD_HASH_MISMATCH"
+    AUDIT_MISMATCH = "AUDIT_MISMATCH"
+    RACE_LOST = "RACE_LOST"
+
+
+@dataclass(frozen=True)
+class OfflineOutboxIdentity:
+    """Every immutable field an offline recovery operator must pre-commit to."""
+
+    id: int
+    producer: str
+    message_id: str
+    topic: str
+    payload_sha256: str
+    publish_attempts: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, int) or isinstance(self.id, bool) or self.id <= 0:
+            raise ValueError("offline outbox identity id must be a positive integer")
+        for name, value in (
+            ("producer", self.producer),
+            ("message_id", self.message_id),
+            ("topic", self.topic),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"offline outbox identity {name} must be a non-empty string")
+        if (
+            not isinstance(self.payload_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.payload_sha256) is None
+        ):
+            raise ValueError("offline outbox identity payload_sha256 must be a lowercase SHA-256")
+        if (
+            not isinstance(self.publish_attempts, int)
+            or isinstance(self.publish_attempts, bool)
+            or self.publish_attempts < 0
+        ):
+            raise ValueError("offline outbox identity publish_attempts must be a non-negative integer")
+
+
+@dataclass(frozen=True)
+class OfflineOutboxClaim:
+    """A single persisted row leased for one explicit offline reconciliation."""
+
+    identity: OfflineOutboxIdentity
+    payload: dict[str, Any]
+    reconciliation_id: str
+    claimed_publish_attempts: int
+
+
+@dataclass(frozen=True)
+class OfflineOutboxClaimResult:
+    """A claim or a concrete reason it was fail-closed before publishing."""
+
+    state: OfflineOutboxClaimState
+    claim: OfflineOutboxClaim | None = None
+    rejection: OfflineOutboxClaimRejection | None = None
+
+    def __post_init__(self) -> None:
+        if self.state is OfflineOutboxClaimState.CLAIMED:
+            if self.claim is None or self.rejection is not None:
+                raise ValueError("claimed offline outbox result must contain only a claim")
+        elif self.claim is not None or self.rejection is None:
+            raise ValueError("rejected offline outbox result must contain only a rejection")
 
 
 class MessageIdentityConflict(RuntimeError):
@@ -478,6 +563,284 @@ class AuditRepository:
             )
         return False
 
+    @staticmethod
+    def _canonical_outbox_payload(payload: Any) -> tuple[dict[str, Any], str]:
+        """Return the only accepted JSON representation of an outbox payload."""
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise ValueError("outbox payload is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("outbox payload must be a JSON object")
+        try:
+            canonical = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("outbox payload is not canonicalizable") from exc
+        return json.loads(canonical), hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _validate_exact_offline_outbox(
+        cls,
+        row: asyncpg.Record | dict[str, Any] | None,
+        *,
+        identity: OfflineOutboxIdentity,
+        audit_rows: list[asyncpg.Record] | list[dict[str, Any]],
+        has_unpublished_predecessor: bool,
+    ) -> OfflineOutboxClaimRejection | None:
+        """Validate all recovery invariants before an external publish is possible."""
+        if row is None:
+            return OfflineOutboxClaimRejection.NOT_FOUND
+        if any(
+            row[name] != expected
+            for name, expected in (
+                ("id", identity.id),
+                ("producer", identity.producer),
+                ("message_id", identity.message_id),
+                ("topic", identity.topic),
+                ("payload_sha256", identity.payload_sha256),
+                ("publish_attempts", identity.publish_attempts),
+            )
+        ):
+            return OfflineOutboxClaimRejection.IDENTITY_MISMATCH
+        if row["published_at"] is not None:
+            return OfflineOutboxClaimRejection.ALREADY_PUBLISHED
+        if row["dead_lettered_at"] is not None:
+            return OfflineOutboxClaimRejection.DEAD_LETTERED
+        if not row["lease_expired"]:
+            return OfflineOutboxClaimRejection.LEASE_NOT_EXPIRED
+        if not row["available"]:
+            return OfflineOutboxClaimRejection.NOT_YET_AVAILABLE
+        if row["reconciliation_state"] != "NONE":
+            return OfflineOutboxClaimRejection.RECONCILIATION_NOT_CLEAR
+        if has_unpublished_predecessor:
+            return OfflineOutboxClaimRejection.EARLIER_UNPUBLISHED_PREDECESSOR
+        try:
+            payload, actual_sha256 = cls._canonical_outbox_payload(row["payload"])
+        except ValueError:
+            return OfflineOutboxClaimRejection.PAYLOAD_HASH_MISMATCH
+        if actual_sha256 != identity.payload_sha256 or payload.get("message_id") != identity.message_id:
+            return OfflineOutboxClaimRejection.PAYLOAD_HASH_MISMATCH
+        if len(audit_rows) != 1:
+            return OfflineOutboxClaimRejection.AUDIT_MISMATCH
+        audit = audit_rows[0]
+        try:
+            audit_payload, audit_sha256 = cls._canonical_outbox_payload(audit["payload"])
+        except ValueError:
+            return OfflineOutboxClaimRejection.AUDIT_MISMATCH
+        if (
+            audit["topic"] != identity.topic
+            or audit_sha256 != identity.payload_sha256
+            or audit_payload != payload
+            or audit_payload.get("message_id") != identity.message_id
+        ):
+            return OfflineOutboxClaimRejection.AUDIT_MISMATCH
+        return None
+
+    @staticmethod
+    def _require_reconciliation_id(reconciliation_id: str) -> str:
+        if (
+            not isinstance(reconciliation_id, str)
+            or not reconciliation_id.strip()
+            or len(reconciliation_id) > 200
+        ):
+            raise ValueError("offline reconciliation_id must be a non-empty string of at most 200 characters")
+        return reconciliation_id.strip()
+
+    async def claim_expired_outbox_exact(
+        self,
+        identity: OfflineOutboxIdentity,
+        *,
+        reconciliation_id: str,
+        lease: timedelta = timedelta(minutes=5),
+    ) -> OfflineOutboxClaimResult:
+        """Lease exactly one expired row after exhaustive, immutable verification.
+
+        This is intentionally incompatible with the normal dispatcher: it does
+        not select a producer head or retry a queue. The caller must know every
+        immutable field of one expired row ahead of time, and the durable
+        ``PUBLISHING`` state blocks automatic dispatch after this method commits.
+        """
+        reconciliation_id = self._require_reconciliation_id(reconciliation_id)
+        if not isinstance(lease, timedelta) or not timedelta(0) < lease <= timedelta(minutes=5):
+            raise ValueError("offline exact outbox lease must be greater than zero and at most five minutes")
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                # The row lock protects the record itself; this named advisory
+                # lock makes independently deployed recovery tools serialize
+                # before they can inspect or mutate the same row.
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"offline-outbox-reconciliation:{identity.id}",
+                )
+                row = await connection.fetchrow(
+                    """SELECT id, producer, message_id, topic, payload, payload_sha256,
+                              publish_attempts, published_at, dead_lettered_at,
+                              (lease_until IS NOT NULL AND lease_until < now()) AS lease_expired,
+                              (available_at <= now()) AS available, reconciliation_state
+                         FROM message_outbox
+                        WHERE id=$1
+                        FOR UPDATE""",
+                    identity.id,
+                )
+                audit_rows = await connection.fetch(
+                    """SELECT topic, payload
+                         FROM event_audit
+                        WHERE message_id=$1
+                        FOR UPDATE""",
+                    identity.message_id,
+                )
+                predecessor = await connection.fetchrow(
+                    """SELECT id
+                         FROM message_outbox
+                        WHERE producer=$1
+                          AND id < $2
+                          AND published_at IS NULL
+                          AND dead_lettered_at IS NULL
+                        ORDER BY id
+                        LIMIT 1
+                        FOR UPDATE""",
+                    identity.producer,
+                    identity.id,
+                )
+                rejection = self._validate_exact_offline_outbox(
+                    row,
+                    identity=identity,
+                    audit_rows=audit_rows,
+                    has_unpublished_predecessor=predecessor is not None,
+                )
+                if rejection is not None:
+                    return OfflineOutboxClaimResult(
+                        state=OfflineOutboxClaimState.REJECTED,
+                        rejection=rejection,
+                    )
+                claimed = await connection.fetchrow(
+                    """UPDATE message_outbox
+                           SET lease_owner=$1,
+                               lease_until=now()+$2::interval,
+                               publish_attempts=publish_attempts+1,
+                               reconciliation_state='PUBLISHING',
+                               reconciliation_id=$1,
+                               reconciliation_started_at=now(),
+                               reconciliation_outcome_at=NULL,
+                               last_error=NULL
+                         WHERE id=$3
+                           AND producer=$4
+                           AND message_id=$5
+                           AND topic=$6
+                           AND payload_sha256=$7
+                           AND publish_attempts=$8
+                           AND published_at IS NULL
+                           AND dead_lettered_at IS NULL
+                           AND available_at <= now()
+                           AND lease_until < now()
+                           AND reconciliation_state='NONE'
+                     RETURNING publish_attempts""",
+                    reconciliation_id,
+                    lease,
+                    identity.id,
+                    identity.producer,
+                    identity.message_id,
+                    identity.topic,
+                    identity.payload_sha256,
+                    identity.publish_attempts,
+                )
+                if claimed is None:
+                    return OfflineOutboxClaimResult(
+                        state=OfflineOutboxClaimState.REJECTED,
+                        rejection=OfflineOutboxClaimRejection.RACE_LOST,
+                    )
+                payload, _sha256 = self._canonical_outbox_payload(row["payload"])
+                return OfflineOutboxClaimResult(
+                    state=OfflineOutboxClaimState.CLAIMED,
+                    claim=OfflineOutboxClaim(
+                        identity=identity,
+                        payload=payload,
+                        reconciliation_id=reconciliation_id,
+                        claimed_publish_attempts=claimed["publish_attempts"],
+                    ),
+                )
+
+    async def acknowledge_exact_outbox_publish(
+        self,
+        identity: OfflineOutboxIdentity,
+        *,
+        reconciliation_id: str,
+    ) -> bool:
+        """Durably ACK one already-published exact recovery row, never a queue batch."""
+        reconciliation_id = self._require_reconciliation_id(reconciliation_id)
+        status = await self.pool.execute(
+            """UPDATE message_outbox
+                   SET published_at=now(),
+                       lease_until=NULL,
+                       lease_owner=NULL,
+                       last_error=NULL,
+                       reconciliation_state='ACKNOWLEDGED',
+                       reconciliation_outcome_at=now()
+                 WHERE id=$1
+                   AND producer=$2
+                   AND message_id=$3
+                   AND topic=$4
+                   AND payload_sha256=$5
+                   AND publish_attempts=$6
+                   AND reconciliation_state='PUBLISHING'
+                   AND reconciliation_id=$7
+                   AND published_at IS NULL
+                   AND dead_lettered_at IS NULL""",
+            identity.id,
+            identity.producer,
+            identity.message_id,
+            identity.topic,
+            identity.payload_sha256,
+            identity.publish_attempts + 1,
+            reconciliation_id,
+        )
+        return status.endswith("1")
+
+    async def mark_exact_outbox_publish_outcome_unknown(
+        self,
+        identity: OfflineOutboxIdentity,
+        *,
+        reconciliation_id: str,
+        reason: str,
+    ) -> bool:
+        """Permanently block automatic redispatch when a publish result is ambiguous."""
+        reconciliation_id = self._require_reconciliation_id(reconciliation_id)
+        status = await self.pool.execute(
+            """UPDATE message_outbox
+                   SET lease_until=NULL,
+                       lease_owner=NULL,
+                       last_error=$8,
+                       reconciliation_state='PUBLISH_OUTCOME_UNKNOWN',
+                       reconciliation_outcome_at=now()
+                 WHERE id=$1
+                   AND producer=$2
+                   AND message_id=$3
+                   AND topic=$4
+                   AND payload_sha256=$5
+                   AND publish_attempts=$6
+                   AND reconciliation_state='PUBLISHING'
+                   AND reconciliation_id=$7
+                   AND published_at IS NULL
+                   AND dead_lettered_at IS NULL""",
+            identity.id,
+            identity.producer,
+            identity.message_id,
+            identity.topic,
+            identity.payload_sha256,
+            identity.publish_attempts + 1,
+            reconciliation_id,
+            reason[:4000],
+        )
+        return status.endswith("1")
+
     async def pending_outbox(self, limit: int = 100) -> list[asyncpg.Record]:
         return await self.pool.fetch(
             """SELECT id, producer, message_id, topic, payload FROM message_outbox
@@ -504,6 +867,7 @@ class AuditRepository:
                             WHERE outbox.producer=$4
                               AND outbox.published_at IS NULL
                               AND outbox.dead_lettered_at IS NULL
+                              AND outbox.reconciliation_state='NONE'
                               AND outbox.available_at <= now()
                               AND (outbox.lease_until IS NULL OR outbox.lease_until < now())
                               AND NOT EXISTS (
@@ -552,7 +916,8 @@ class AuditRepository:
     async def mark_published(self, row_id: int, worker_id: str) -> bool:
         status = await self.pool.execute(
             """UPDATE message_outbox SET published_at=now(), lease_until=NULL, lease_owner=NULL,
-               last_error=NULL WHERE id=$1 AND lease_owner=$2 AND published_at IS NULL""",
+               last_error=NULL WHERE id=$1 AND lease_owner=$2 AND published_at IS NULL
+               AND reconciliation_state='NONE'""",
             row_id,
             worker_id,
         )
@@ -570,9 +935,10 @@ class AuditRepository:
         status = await self.pool.execute(
             """UPDATE message_outbox SET
                  last_error=$3, lease_until=NULL, lease_owner=NULL,
-                 available_at=now()+$4::interval,
-                 dead_lettered_at=CASE WHEN publish_attempts >= $5 THEN now() ELSE NULL END
-               WHERE id=$1 AND lease_owner=$2 AND published_at IS NULL""",
+               available_at=now()+$4::interval,
+                dead_lettered_at=CASE WHEN publish_attempts >= $5 THEN now() ELSE NULL END
+               WHERE id=$1 AND lease_owner=$2 AND published_at IS NULL
+                 AND reconciliation_state='NONE'""",
             row_id,
             worker_id,
             error[:4000],

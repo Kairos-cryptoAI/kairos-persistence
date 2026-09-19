@@ -17,12 +17,22 @@ from .mutation_budget import (
     ExecutionMutationBudgetRepository,
     ExecutionMutationReservation,
 )
+from .offline_outbox_reconciler import (
+    OfflineOutboxReconciler,
+    OfflineOutboxReconciliationResult,
+    OfflineOutboxReconciliationState,
+)
 from .offline_writer import OfflineDurableWriter, OfflineWriterError
 from .repository import (
     AuditRepository,
     InboxClaim,
     InboxTransaction,
     MessageIdentityConflict,
+    OfflineOutboxClaim,
+    OfflineOutboxClaimRejection,
+    OfflineOutboxClaimResult,
+    OfflineOutboxClaimState,
+    OfflineOutboxIdentity,
     OutboxRecord,
 )
 from .runtime import DurableMessageBus, canonical_payload
@@ -88,6 +98,14 @@ __all__ = [
     "InboxClaim",
     "InboxTransaction",
     "MessageIdentityConflict",
+    "OfflineOutboxClaim",
+    "OfflineOutboxClaimRejection",
+    "OfflineOutboxClaimResult",
+    "OfflineOutboxClaimState",
+    "OfflineOutboxIdentity",
+    "OfflineOutboxReconciler",
+    "OfflineOutboxReconciliationResult",
+    "OfflineOutboxReconciliationState",
     "OutboxRecord",
     "OfflineDurableWriter",
     "OfflineWriterError",
