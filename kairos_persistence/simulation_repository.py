@@ -61,6 +61,22 @@ class SimulationCommandCompletion:
     created: bool
 
 
+@dataclass(frozen=True, slots=True)
+class SimulationTradeJournal:
+    """Verified materialized SIM lifecycle state and its immutable event chain.
+
+    This is a read model only.  The controller uses it to resume a prepared
+    command without assuming that an in-memory lifecycle state survived a
+    process restart.  It intentionally carries no venue or account state.
+    """
+
+    trade: SimulationTradeV1
+    state: _SimulationTradeState
+    next_event_seq: int
+    journal_head_sha256: str | None
+    events: tuple[SimulationTradeEventV2, ...]
+
+
 class SimulationRepository:
     """Append-only input tape plus crash-safe SIM lifecycle journal.
 
@@ -914,6 +930,119 @@ class SimulationRepository:
             raise MessageIdentityConflict("simulation private liquidity state payload hash does not match")
         return str(row["state_schema_version"]), payload
 
+    async def load_latest_book_frame(
+        self,
+        tape_id: str,
+        symbol: str,
+        *,
+        as_of_ms: int,
+    ) -> RecordedTopNBookFrameV1 | None:
+        """Return the newest admitted, sealed-tape book no later than ``as_of_ms``.
+
+        The frame's captured ``persisted_at_ms`` is the only clock used for
+        selection.  This prevents the controller from reaching forward into a
+        recorded tape based on later knowledge, and refuses an unsealed tape
+        rather than silently modelling mutable market data.
+        """
+
+        self._validate_tape_id(tape_id)
+        if symbol not in _SYMBOLS:
+            raise ValueError("simulation symbol is outside the fixed five-symbol universe")
+        self._validate_timestamp("as_of_ms", as_of_ms)
+        tape = await self.pool.fetchrow("SELECT state FROM sim_tapes WHERE tape_id=$1", tape_id)
+        if tape is None:
+            raise KeyError(f"unknown simulation tape {tape_id!r}")
+        if str(tape["state"]) != "SEALED":
+            raise ValueError("simulation book selection requires an immutable sealed tape")
+        row = await self.pool.fetchrow(
+            """SELECT payload_sha256, payload FROM sim_book_frames
+               WHERE tape_id=$1 AND symbol=$2 AND continuity='ADMITTED'
+                 AND persisted_at_ms <= $3
+               ORDER BY persisted_at_ms DESC, tape_sequence DESC
+               LIMIT 1""",
+            tape_id,
+            symbol,
+            as_of_ms,
+        )
+        if row is None:
+            return None
+        return self._stored_model(row, RecordedTopNBookFrameV1, "simulation book frame")
+
+    async def load_command_receipt(self, command_id: str) -> SimulationCommandReceiptV1 | None:
+        """Load one terminal receipt exactly as it was persisted, if any."""
+
+        self._validate_sha256("command_id", command_id)
+        row = await self.pool.fetchrow(
+            "SELECT payload_sha256, payload FROM sim_command_receipts WHERE command_id=$1",
+            command_id,
+        )
+        if row is None:
+            return None
+        receipt = self._stored_model(row, SimulationCommandReceiptV1, "simulation command receipt")
+        if receipt.command_id != command_id:
+            raise MessageIdentityConflict("simulation command receipt does not match its durable command")
+        return receipt
+
+    async def list_prepared_commands(self, session_id: str) -> tuple[SimulationCommandV1, ...]:
+        """Return only still-prepared commands for one isolated session.
+
+        A caller may safely resume these commands.  Completed commands are
+        deliberately omitted so recovery cannot recalculate a durable model
+        receipt or consume simulated depth twice.
+        """
+
+        self._validate_sha256("session_id", session_id)
+        rows = await self.pool.fetch(
+            """SELECT payload_sha256, payload FROM sim_commands
+               WHERE session_id=$1 AND status='PREPARED'
+               ORDER BY prepared_at, command_id""",
+            session_id,
+        )
+        commands = tuple(
+            self._stored_model(row, SimulationCommandV1, "simulation command") for row in rows
+        )
+        if any(command.session_id != session_id for command in commands):
+            raise MessageIdentityConflict("prepared simulation command differs from requested session")
+        return commands
+
+    async def load_trade_journal(self, trade_id: str) -> SimulationTradeJournal | None:
+        """Load and verify the durable state materialization for one SIM trade."""
+
+        self._validate_sha256("trade_id", trade_id)
+        async with self.pool.acquire() as connection, connection.transaction():
+            await self._trade_lock(connection, trade_id)
+            trade_row = await connection.fetchrow(
+                "SELECT * FROM sim_trades WHERE trade_id=$1 FOR SHARE", trade_id
+            )
+            if trade_row is None:
+                return None
+            event_rows = await connection.fetch(
+                """SELECT * FROM sim_trade_events WHERE trade_id=$1
+                   ORDER BY event_seq FOR SHARE""",
+                trade_id,
+            )
+            return self._materialize_trade_journal(trade_row, event_rows)
+
+    async def list_terminal_trades_without_result(self, session_id: str) -> tuple[SimulationTradeV1, ...]:
+        """Return terminal lifecycles that need idempotent result recovery."""
+
+        self._validate_sha256("session_id", session_id)
+        rows = await self.pool.fetch(
+            """SELECT trade.payload_sha256, trade.payload
+               FROM sim_trades AS trade
+               LEFT JOIN sim_results AS result ON result.trade_id=trade.trade_id
+               WHERE trade.session_id=$1
+                 AND trade.state = ANY($2::text[])
+                 AND result.trade_id IS NULL
+               ORDER BY trade.trade_id""",
+            session_id,
+            ["FLAT", "UNRESOLVED", "NO_FILL", "BLOCKED"],
+        )
+        trades = tuple(self._stored_model(row, SimulationTradeV1, "simulation trade") for row in rows)
+        if any(trade.session_id != session_id for trade in trades):
+            raise MessageIdentityConflict("terminal simulation trade differs from requested session")
+        return trades
+
     async def verify_tape(self, tape_id: str) -> bool:
         """Verify every stored public input and its per-bar/global-book hash chains."""
 
@@ -1074,6 +1203,76 @@ class SimulationRepository:
                 and trade["journal_head_sha256"] == previous_event_sha256
                 and int(trade["event_count"]) == len(events)
             )
+
+    @classmethod
+    def _materialize_trade_journal(
+        cls,
+        trade_row: asyncpg.Record,
+        event_rows: Sequence[asyncpg.Record],
+    ) -> SimulationTradeJournal:
+        """Validate a read-model snapshot before it is used for recovery.
+
+        ``load_trade_journal`` uses the same invariants as the explicit chain
+        verifier, but returns the verified public events for a controller that
+        needs the next immutable transition.  No lifecycle fact is inferred
+        from table columns alone.
+        """
+
+        trade = cls._stored_model(trade_row, SimulationTradeV1, "simulation trade")
+        if (
+            trade.trade_id != str(trade_row["trade_id"])
+            or trade.session_id != str(trade_row["session_id"])
+            or trade.admission_id != str(trade_row["admission_id"])
+            or trade.intent_id != str(trade_row["intent_id"])
+            or trade.symbol != str(trade_row["symbol"])
+            or trade.side is None
+            or trade.side.value != str(trade_row["side"])
+        ):
+            raise MessageIdentityConflict("simulation trade table lineage differs from its public payload")
+        expected_sequence = 1
+        previous_event_sha256: str | None = None
+        state: _SimulationTradeState = "PENDING"
+        events: list[SimulationTradeEventV2] = []
+        for row in event_rows:
+            event = cls._stored_model(row, SimulationTradeEventV2, "simulation trade event")
+            if (
+                event.trade_id != trade.trade_id
+                or event.session_id != trade.session_id
+                or event.admission_id != trade.admission_id
+                or event.intent_id != trade.intent_id
+                or event.symbol != trade.symbol
+                or event.side != trade.side.value
+                or event.event_id is None
+                or event.event_id != str(row["event_id"])
+                or event.event_id != str(row["event_sha256"])
+                or event.event_seq != expected_sequence
+                or event.previous_event_sha256 != previous_event_sha256
+            ):
+                raise MessageIdentityConflict("simulation trade event chain differs from durable lifecycle")
+            expected_from_state = None if expected_sequence == 1 else state
+            if event.from_state != expected_from_state:
+                raise MessageIdentityConflict("simulation event prior state differs from durable lifecycle")
+            state = cast(_SimulationTradeState, event.to_state)
+            previous_event_sha256 = event.event_id
+            expected_sequence += 1
+            events.append(event)
+        materialized_state = str(trade_row["state"])
+        if materialized_state not in {"PENDING", "ACTIVE", "FLAT", "UNRESOLVED", "NO_FILL", "BLOCKED"}:
+            raise MessageIdentityConflict("simulation trade has an unknown materialized lifecycle state")
+        if (
+            materialized_state != state
+            or int(trade_row["next_event_seq"]) != expected_sequence
+            or trade_row["journal_head_sha256"] != previous_event_sha256
+            or int(trade_row["event_count"]) != len(events)
+        ):
+            raise MessageIdentityConflict("simulation trade materialization does not match its event chain")
+        return SimulationTradeJournal(
+            trade=trade,
+            state=cast(_SimulationTradeState, materialized_state),
+            next_event_seq=expected_sequence,
+            journal_head_sha256=previous_event_sha256,
+            events=tuple(events),
+        )
 
     async def _append_trade_event_locked(
         self,

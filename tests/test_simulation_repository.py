@@ -322,6 +322,21 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
         )
         prepared = await repository.prepare_command(entry_command)
         assert prepared.created and prepared.status == "PREPARED"
+        assert await repository.list_prepared_commands(session_id) == (entry_command,)
+        assert (
+            await repository.load_latest_book_frame(
+                tape_id,
+                "BTCUSDT",
+                as_of_ms=_T0 + 60_021,
+            )
+        ) == frames["BTCUSDT"]
+        assert (
+            await repository.load_latest_book_frame(
+                tape_id,
+                "BTCUSDT",
+                as_of_ms=_T0 + 60_019,
+            )
+        ) is None
         entry_receipt = SimulationCommandReceiptV1(
             source="market-simulator-test",
             command=entry_command,
@@ -371,6 +386,8 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
             events=(entered,),
         )
         assert first_completion.created
+        assert await repository.list_prepared_commands(session_id) == ()
+        assert await repository.load_command_receipt(_identity(entry_command.command_id)) == entry_receipt
         assert not (
             await repository.complete_command(
                 entry_command,
@@ -443,6 +460,14 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
                 events=(flat,),
             )
         ).created
+        journal = await repository.load_trade_journal(trade_id)
+        assert journal is not None
+        assert journal.trade == trade
+        assert journal.state == "FLAT"
+        assert journal.next_event_seq == 4
+        assert journal.journal_head_sha256 == flat.event_id
+        assert journal.events == (admitted, entered, flat)
+        assert await repository.list_terminal_trades_without_result(session_id) == (trade,)
         result = SimulationResultV1(
             source="market-simulator-test",
             session_id=session_id,
@@ -461,6 +486,7 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
             reason_codes=("SIM_TIMEOUT",),
         )
         assert await repository.record_result(result)
+        assert await repository.list_terminal_trades_without_result(session_id) == ()
         receipt = SimulationSessionReceiptV1(
             source="market-simulator-test",
             session=session,

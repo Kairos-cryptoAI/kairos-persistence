@@ -32,6 +32,7 @@ from .simulation_repository import (
     SimulationCommandPreparation,
     SimulationJournalRepository,
     SimulationRepository,
+    SimulationTradeJournal,
 )
 from .source_state import (
     CAMPAIGN_PROVIDER_CAPS,
@@ -78,6 +79,7 @@ __all__ = [
     "SimulationJournalRepository",
     "SimulationCommandPreparation",
     "SimulationCommandCompletion",
+    "SimulationTradeJournal",
     "ExecutionMutationBudgetRepository",
     "ExecutionMutationReservation",
     "DEFAULT_COMPENSATION_RESERVE",
