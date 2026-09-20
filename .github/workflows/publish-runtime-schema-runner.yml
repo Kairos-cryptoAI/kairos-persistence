@@ -85,8 +85,8 @@ jobs:
               raise SystemExit("installed migration package differs from reviewed source")
           PY
           test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE:$PERSISTENCE_REVISION")" = '10001:10001'
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.source\" }}' "$IMAGE:$PERSISTENCE_REVISION")" = 'https://github.com/Kairos-cryptoAI/kairos-persistence'
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$IMAGE:$PERSISTENCE_REVISION")" = "$PERSISTENCE_REVISION"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$IMAGE:$PERSISTENCE_REVISION")" = 'https://github.com/Kairos-cryptoAI/kairos-persistence'
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE:$PERSISTENCE_REVISION")" = "$PERSISTENCE_REVISION"
 
       - name: Authenticate to GitHub Container Registry
         shell: bash
