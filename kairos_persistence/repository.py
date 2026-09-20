@@ -17,6 +17,8 @@ from typing import Any
 import asyncpg
 from kairos_core.contracts.base import KairosMessage
 
+OFFLINE_OUTBOX_RECONCILIATION_MIGRATION = "018_offline_outbox_reconciliation.sql"
+
 
 @dataclass(frozen=True)
 class InboxClaim:
@@ -60,6 +62,31 @@ class OfflineOutboxClaimRejection(StrEnum):
     RACE_LOST = "RACE_LOST"
 
 
+class OfflineOutboxQuarantineState(StrEnum):
+    """Terminal result of a DB-only expired-outbox quarantine attempt."""
+
+    QUARANTINED = "QUARANTINED"
+    ALREADY_QUARANTINED = "ALREADY_QUARANTINED"
+    REJECTED = "REJECTED"
+
+
+class OfflineOutboxQuarantineRejection(StrEnum):
+    """Fail-closed reasons an expired effect was not quarantined."""
+
+    MIGRATION_018_REQUIRED = "MIGRATION_018_REQUIRED"
+    NOT_FOUND = "NOT_FOUND"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    ALREADY_PUBLISHED = "ALREADY_PUBLISHED"
+    DEAD_LETTERED = "DEAD_LETTERED"
+    LEASE_NOT_EXPIRED = "LEASE_NOT_EXPIRED"
+    LEASE_IDENTITY_MISMATCH = "LEASE_IDENTITY_MISMATCH"
+    NOT_YET_AVAILABLE = "NOT_YET_AVAILABLE"
+    RECONCILIATION_NOT_CLEAR = "RECONCILIATION_NOT_CLEAR"
+    PAYLOAD_HASH_MISMATCH = "PAYLOAD_HASH_MISMATCH"
+    AUDIT_MISMATCH = "AUDIT_MISMATCH"
+    RACE_LOST = "RACE_LOST"
+
+
 @dataclass(frozen=True)
 class OfflineOutboxIdentity:
     """Every immutable field an offline recovery operator must pre-commit to."""
@@ -95,6 +122,24 @@ class OfflineOutboxIdentity:
 
 
 @dataclass(frozen=True)
+class OfflineOutboxExpiredLease:
+    """Immutable lease values copied from the inspected expired-effect receipt."""
+
+    owner: str
+    until: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner, str) or not self.owner.strip():
+            raise ValueError("offline expired lease owner must be a non-empty string")
+        if (
+            not isinstance(self.until, datetime)
+            or self.until.tzinfo is None
+            or self.until.utcoffset() is None
+        ):
+            raise ValueError("offline expired lease until must be a timezone-aware datetime")
+
+
+@dataclass(frozen=True)
 class OfflineOutboxClaim:
     """A single persisted row leased for one explicit offline reconciliation."""
 
@@ -118,6 +163,49 @@ class OfflineOutboxClaimResult:
                 raise ValueError("claimed offline outbox result must contain only a claim")
         elif self.claim is not None or self.rejection is None:
             raise ValueError("rejected offline outbox result must contain only a rejection")
+
+
+@dataclass(frozen=True)
+class OfflineOutboxQuarantineReceipt:
+    """Durable state returned for a new or idempotently repeated quarantine."""
+
+    reconciliation_id: str
+    reason: str
+    legacy_lease: OfflineOutboxExpiredLease
+    started_at: datetime
+    outcome_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reconciliation_id, str) or not self.reconciliation_id.strip():
+            raise ValueError("offline quarantine receipt reconciliation_id must be non-empty")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("offline quarantine receipt reason must be non-empty")
+        for name, value in (("started_at", self.started_at), ("outcome_at", self.outcome_at)):
+            if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"offline quarantine receipt {name} must be timezone-aware")
+        if self.outcome_at < self.started_at:
+            raise ValueError("offline quarantine receipt outcome_at must not precede started_at")
+
+
+@dataclass(frozen=True)
+class OfflineOutboxQuarantineResult:
+    """One exact expired effect was quarantined, already quarantined, or unchanged."""
+
+    state: OfflineOutboxQuarantineState
+    identity: OfflineOutboxIdentity
+    receipt: OfflineOutboxQuarantineReceipt | None = None
+    rejection: OfflineOutboxQuarantineRejection | None = None
+
+    def __post_init__(self) -> None:
+        terminal_states = {
+            OfflineOutboxQuarantineState.QUARANTINED,
+            OfflineOutboxQuarantineState.ALREADY_QUARANTINED,
+        }
+        if self.state in terminal_states:
+            if self.rejection is not None or self.receipt is None:
+                raise ValueError("quarantined offline outbox result requires only a durable receipt")
+        elif self.receipt is not None or self.rejection is None:
+            raise ValueError("rejected offline outbox result requires only a rejection")
 
 
 class MessageIdentityConflict(RuntimeError):
@@ -595,10 +683,13 @@ class AuditRepository:
         audit_rows: list[asyncpg.Record] | list[dict[str, Any]],
         has_unpublished_predecessor: bool,
         lease_requirement: str = "expired",
+        require_reconciliation_clear: bool = True,
+        require_no_unpublished_predecessor: bool = True,
+        require_available: bool = True,
     ) -> OfflineOutboxClaimRejection | None:
         """Validate all recovery invariants before an external publish is possible."""
-        if lease_requirement not in {"expired", "clear"}:
-            raise ValueError("offline outbox lease requirement must be expired or clear")
+        if lease_requirement not in {"expired", "clear", "ignored"}:
+            raise ValueError("offline outbox lease requirement must be expired, clear, or ignored")
         if row is None:
             return OfflineOutboxClaimRejection.NOT_FOUND
         if any(
@@ -621,11 +712,11 @@ class AuditRepository:
             return OfflineOutboxClaimRejection.LEASE_NOT_EXPIRED
         if lease_requirement == "clear" and not row["lease_clear"]:
             return OfflineOutboxClaimRejection.LEASE_PRESENT
-        if not row["available"]:
+        if require_available and not row["available"]:
             return OfflineOutboxClaimRejection.NOT_YET_AVAILABLE
-        if row["reconciliation_state"] != "NONE":
+        if require_reconciliation_clear and row["reconciliation_state"] != "NONE":
             return OfflineOutboxClaimRejection.RECONCILIATION_NOT_CLEAR
-        if has_unpublished_predecessor:
+        if require_no_unpublished_predecessor and has_unpublished_predecessor:
             return OfflineOutboxClaimRejection.EARLIER_UNPUBLISHED_PREDECESSOR
         try:
             payload, actual_sha256 = cls._canonical_outbox_payload(row["payload"])
@@ -658,6 +749,273 @@ class AuditRepository:
         ):
             raise ValueError("offline reconciliation_id must be a non-empty string of at most 200 characters")
         return reconciliation_id.strip()
+
+    @staticmethod
+    def _require_quarantine_reason(reason: str) -> str:
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 3500:
+            raise ValueError(
+                "offline quarantine reason must be a non-empty string of at most 3500 characters"
+            )
+        return reason.strip()
+
+    @staticmethod
+    def _quarantine_evidence(reason: str, expired_lease: OfflineOutboxExpiredLease) -> str:
+        """Canonical durable evidence for an otherwise-cleared historical lease."""
+        lease_until = expired_lease.until.astimezone(UTC).isoformat(timespec="microseconds")
+        evidence = json.dumps(
+            {
+                "expired_lease_owner_sha256": hashlib.sha256(expired_lease.owner.encode("utf-8")).hexdigest(),
+                "expired_lease_until": lease_until,
+                "reason": reason,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(evidence) > 4000:
+            raise ValueError("offline quarantine evidence exceeds the durable error limit")
+        return evidence
+
+    @staticmethod
+    def _as_quarantine_rejection(
+        rejection: OfflineOutboxClaimRejection,
+    ) -> OfflineOutboxQuarantineRejection:
+        """Keep the direct-quarantine API distinct without weakening its checks."""
+        return OfflineOutboxQuarantineRejection(rejection.value)
+
+    @staticmethod
+    def _quarantine_receipt(
+        *,
+        reconciliation_id: str,
+        reason: str,
+        legacy_lease: OfflineOutboxExpiredLease,
+        started_at: Any,
+        outcome_at: Any,
+    ) -> OfflineOutboxQuarantineReceipt | None:
+        if (
+            not isinstance(started_at, datetime)
+            or started_at.tzinfo is None
+            or started_at.utcoffset() is None
+            or not isinstance(outcome_at, datetime)
+            or outcome_at.tzinfo is None
+            or outcome_at.utcoffset() is None
+            or outcome_at < started_at
+        ):
+            return None
+        return OfflineOutboxQuarantineReceipt(
+            reconciliation_id=reconciliation_id,
+            reason=reason,
+            legacy_lease=legacy_lease,
+            started_at=started_at,
+            outcome_at=outcome_at,
+        )
+
+    async def quarantine_expired_outbox_exact(
+        self,
+        identity: OfflineOutboxIdentity,
+        *,
+        expired_lease: OfflineOutboxExpiredLease,
+        reconciliation_id: str,
+        reason: str,
+    ) -> OfflineOutboxQuarantineResult:
+        """Atomically quarantine one exact expired effect without a transport call.
+
+        This is a DB-only operator primitive for a known expired lease.  It is
+        valid only once migration 018 is present, locks the exact outbox and
+        audit identity in one transaction, and binds the expired lease values
+        captured in the inspected receipt. It never claims, publishes, retries,
+        or increments ``publish_attempts``. A rejection performs no outbox
+        mutation. ``last_error`` stores canonical reason plus lease hash/timestamp
+        evidence, so the same durable outcome can be read idempotently only with
+        the same exact reconciliation id, reason, and lease identity.
+        """
+        if not isinstance(expired_lease, OfflineOutboxExpiredLease):
+            raise ValueError("offline quarantine requires an explicit expired lease identity")
+        reconciliation_id = self._require_reconciliation_id(reconciliation_id)
+        reason = self._require_quarantine_reason(reason)
+        evidence = self._quarantine_evidence(reason, expired_lease)
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                migration_table_exists = await connection.fetchval(
+                    "SELECT to_regclass('schema_migrations') IS NOT NULL"
+                )
+                if not migration_table_exists:
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.MIGRATION_018_REQUIRED,
+                    )
+                migration_applied = await connection.fetchval(
+                    "SELECT 1 FROM schema_migrations WHERE version=$1",
+                    OFFLINE_OUTBOX_RECONCILIATION_MIGRATION,
+                )
+                if not migration_applied:
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.MIGRATION_018_REQUIRED,
+                    )
+
+                # This makes separately deployed operator tools serialize
+                # before reading or mutating the same immutable effect.
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"offline-outbox-quarantine:{identity.id}",
+                )
+                row = await connection.fetchrow(
+                    """SELECT id, producer, message_id, topic, payload, payload_sha256,
+                              publish_attempts, published_at, dead_lettered_at,
+                              lease_owner, lease_until, last_error,
+                              (lease_until IS NOT NULL AND lease_until < now()) AS lease_expired,
+                              (available_at <= now()) AS available, reconciliation_state,
+                              reconciliation_id, reconciliation_started_at,
+                              reconciliation_outcome_at
+                         FROM message_outbox
+                        WHERE id=$1
+                        FOR UPDATE""",
+                    identity.id,
+                )
+                audit_rows = await connection.fetch(
+                    """SELECT topic, payload
+                         FROM event_audit
+                        WHERE message_id=$1
+                        FOR UPDATE""",
+                    identity.message_id,
+                )
+                rejection = self._validate_exact_offline_outbox(
+                    row,
+                    identity=identity,
+                    audit_rows=audit_rows,
+                    # A direct quarantine only freezes this ambiguous effect;
+                    # historical same-producer backlog belongs in the signed
+                    # inspection receipt, not in a condition that could stop
+                    # the safety transition.
+                    has_unpublished_predecessor=False,
+                    lease_requirement="ignored",
+                    require_reconciliation_clear=False,
+                    require_no_unpublished_predecessor=False,
+                    require_available=False,
+                )
+                if rejection is not None:
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=self._as_quarantine_rejection(rejection),
+                    )
+
+                if row is None:
+                    raise RuntimeError("validated offline outbox row unexpectedly disappeared")
+                if row["reconciliation_state"] == "PUBLISH_OUTCOME_UNKNOWN":
+                    receipt = self._quarantine_receipt(
+                        reconciliation_id=reconciliation_id,
+                        reason=reason,
+                        legacy_lease=expired_lease,
+                        started_at=row["reconciliation_started_at"],
+                        outcome_at=row["reconciliation_outcome_at"],
+                    )
+                    if (
+                        receipt is not None
+                        and row["reconciliation_id"] == reconciliation_id
+                        and row["last_error"] == evidence
+                        and row["lease_owner"] is None
+                        and row["lease_until"] is None
+                    ):
+                        return OfflineOutboxQuarantineResult(
+                            state=OfflineOutboxQuarantineState.ALREADY_QUARANTINED,
+                            identity=identity,
+                            receipt=receipt,
+                        )
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.RECONCILIATION_NOT_CLEAR,
+                    )
+                if row["reconciliation_state"] != "NONE":
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.RECONCILIATION_NOT_CLEAR,
+                    )
+                if not row["available"]:
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.NOT_YET_AVAILABLE,
+                    )
+                if not row["lease_expired"]:
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.LEASE_NOT_EXPIRED,
+                    )
+                if row["lease_owner"] != expired_lease.owner or row["lease_until"] != expired_lease.until:
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.LEASE_IDENTITY_MISMATCH,
+                    )
+
+                quarantined = await connection.fetchrow(
+                    """UPDATE message_outbox
+                           SET lease_until=NULL,
+                               lease_owner=NULL,
+                               last_error=$9,
+                               reconciliation_state='PUBLISH_OUTCOME_UNKNOWN',
+                               reconciliation_id=$10,
+                               reconciliation_started_at=now(),
+                               reconciliation_outcome_at=now()
+                         WHERE id=$1
+                           AND producer=$2
+                           AND message_id=$3
+                           AND topic=$4
+                           AND payload_sha256=$5
+                           AND publish_attempts=$6
+                           AND lease_owner=$7
+                           AND lease_until=$8
+                           AND published_at IS NULL
+                           AND dead_lettered_at IS NULL
+                           AND available_at <= now()
+                           AND lease_until < now()
+                           AND reconciliation_state='NONE'
+                     RETURNING reconciliation_id, last_error,
+                               reconciliation_started_at, reconciliation_outcome_at""",
+                    identity.id,
+                    identity.producer,
+                    identity.message_id,
+                    identity.topic,
+                    identity.payload_sha256,
+                    identity.publish_attempts,
+                    expired_lease.owner,
+                    expired_lease.until,
+                    evidence,
+                    reconciliation_id,
+                )
+                if quarantined is None:
+                    return OfflineOutboxQuarantineResult(
+                        state=OfflineOutboxQuarantineState.REJECTED,
+                        identity=identity,
+                        rejection=OfflineOutboxQuarantineRejection.RACE_LOST,
+                    )
+                receipt = self._quarantine_receipt(
+                    reconciliation_id=quarantined["reconciliation_id"],
+                    reason=reason,
+                    legacy_lease=expired_lease,
+                    started_at=quarantined["reconciliation_started_at"],
+                    outcome_at=quarantined["reconciliation_outcome_at"],
+                )
+                if receipt is None:
+                    raise RuntimeError("quarantine update returned an incomplete durable receipt")
+                if (
+                    quarantined["reconciliation_id"] != reconciliation_id
+                    or quarantined["last_error"] != evidence
+                ):
+                    raise RuntimeError("quarantine update returned mismatched durable evidence")
+                return OfflineOutboxQuarantineResult(
+                    state=OfflineOutboxQuarantineState.QUARANTINED,
+                    identity=identity,
+                    receipt=receipt,
+                )
 
     async def claim_expired_outbox_exact(
         self,
