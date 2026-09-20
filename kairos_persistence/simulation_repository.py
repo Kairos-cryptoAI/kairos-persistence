@@ -324,9 +324,7 @@ class SimulationRepository:
                 )
         return True
 
-    async def load_open_book_recording_cursor(
-        self, tape_id: str
-    ) -> SimulationBookRecordingCursor | None:
+    async def load_open_book_recording_cursor(self, tape_id: str) -> SimulationBookRecordingCursor | None:
         """Load a verified append cursor without reopening a completed tape.
 
         The tape advisory lock makes the returned tail a coherent snapshot for
@@ -1563,9 +1561,7 @@ class SimulationRepository:
         return frame
 
     @classmethod
-    def _assert_book_frame_storage(
-        cls, row: asyncpg.Record, expected: _RecordedBookFrame
-    ) -> None:
+    def _assert_book_frame_storage(cls, row: asyncpg.Record, expected: _RecordedBookFrame) -> None:
         """Require a replayed frame to match both its public and raw evidence."""
 
         actual = cls._stored_book_frame(row)
@@ -1575,9 +1571,7 @@ class SimulationRepository:
             )
 
     @classmethod
-    def _assert_exact_book_frame(
-        cls, row: asyncpg.Record, expected: _RecordedBookFrame, entity: str
-    ) -> None:
+    def _assert_exact_book_frame(cls, row: asyncpg.Record, expected: _RecordedBookFrame, entity: str) -> None:
         actual = cls._stored_book_frame(row)
         if actual != expected:
             raise MessageIdentityConflict(f"{entity} stable ID was reused with a different immutable payload")
