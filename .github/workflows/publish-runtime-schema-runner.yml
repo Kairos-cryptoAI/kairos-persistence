@@ -1,0 +1,119 @@
+name: publish-runtime-schema-runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: runtime-schema-runner-1ca8bf38d265ece7a95f749a268075549f80c043
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish reviewed runtime schema runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PERSISTENCE_REVISION: 1ca8bf38d265ece7a95f749a268075549f80c043
+      DEPLOY_REVISION: 28a894e6216bc64a3d85aff1f7a65c25eec3140b
+      IMAGE: ghcr.io/kairos-cryptoai/kairos-runtime-schema-profile-runner
+    steps:
+      - name: Check out workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check out reviewed persistence source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.PERSISTENCE_REVISION }}
+          path: reviewed-persistence
+          persist-credentials: false
+
+      - name: Check out reviewed image recipe
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: Kairos-cryptoAI/kairos-deploy
+          ref: ${{ env.DEPLOY_REVISION }}
+          path: reviewed-deploy
+          persist-credentials: false
+
+      - name: Verify source identities
+        shell: bash
+        run: |
+          test "$(git -C reviewed-persistence rev-parse HEAD)" = "$PERSISTENCE_REVISION"
+          test "$(git -C reviewed-deploy rev-parse HEAD)" = "$DEPLOY_REVISION"
+          test -f reviewed-deploy/docker/Dockerfile
+          test -f reviewed-persistence/kairos_persistence/migrations/018_offline_outbox_reconciliation.sql
+
+      - name: Build the unprivileged runner locally
+        shell: bash
+        run: |
+          docker buildx build --load --pull \
+            --file reviewed-deploy/docker/Dockerfile \
+            --build-context service=reviewed-persistence \
+            --build-arg PACKAGE_DIR=kairos_persistence \
+            --build-arg SOURCE_REPOSITORY=https://github.com/Kairos-cryptoAI/kairos-persistence \
+            --build-arg SOURCE_REVISION="$PERSISTENCE_REVISION" \
+            --tag "$IMAGE:$PERSISTENCE_REVISION" \
+            reviewed-deploy
+
+      - name: Verify installed migration package bytes
+        shell: bash
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --user 10001:10001 \
+            --entrypoint python "$IMAGE:$PERSISTENCE_REVISION" -c '
+          import hashlib
+          import json
+          from importlib.resources import files
+          root = files("kairos_persistence").joinpath("migrations")
+          print(json.dumps({item.name: hashlib.sha256(item.read_bytes()).hexdigest() for item in root.iterdir() if item.name.endswith(".sql")}, sort_keys=True))
+          ' > installed-migrations.json
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          expected = {
+              item.name: hashlib.sha256(item.read_bytes()).hexdigest()
+              for item in Path("reviewed-persistence/kairos_persistence/migrations").glob("*.sql")
+          }
+          actual = json.loads(Path("installed-migrations.json").read_text(encoding="utf-8"))
+          if actual != expected or len(actual) != 18:
+              raise SystemExit("installed migration package differs from reviewed source")
+          PY
+          test "$(docker image inspect --format '{{.Config.User}}' "$IMAGE:$PERSISTENCE_REVISION")" = '10001:10001'
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.source\" }}' "$IMAGE:$PERSISTENCE_REVISION")" = 'https://github.com/Kairos-cryptoAI/kairos-persistence'
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$IMAGE:$PERSISTENCE_REVISION")" = "$PERSISTENCE_REVISION"
+
+      - name: Authenticate to GitHub Container Registry
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish immutable-source tag
+        shell: bash
+        run: docker push "$IMAGE:$PERSISTENCE_REVISION"
+
+      - name: Record published immutable digest
+        id: digest
+        shell: bash
+        run: |
+          digest="$(docker buildx imagetools inspect "$IMAGE:$PERSISTENCE_REVISION" --format '{{.Manifest.Digest}}')"
+          test -n "$digest"
+          printf '%s@%s\n' "$IMAGE" "$digest" | tee runtime-schema-runner-digest.txt
+          echo "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Publish summary
+        shell: bash
+        run: |
+          {
+            echo '## Runtime schema migration runner'
+            echo
+            echo "\`${{ steps.digest.outputs.reference }}\`"
+            echo
+            echo 'The image was built from the reviewed persistence revision, runs as UID/GID 10001, and its installed migration bytes match the source package.'
+          } >> "$GITHUB_STEP_SUMMARY"
