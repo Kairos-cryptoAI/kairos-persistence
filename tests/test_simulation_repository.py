@@ -15,6 +15,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from kairos_core import (
     CandidateReviewTier,
@@ -25,6 +26,7 @@ from kairos_core import (
     ReasoningEffort,
     RecordedBookLevelV1,
     RecordedTopNBookFrameV1,
+    RecordedTopNBookFrameV2,
     ReviewDecision,
     Side,
     SimulationAdmissionV2,
@@ -524,5 +526,64 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
         assert await repository.record_book_frame(barrier)
         with pytest.raises(ValueError, match="gap or reconnect"):
             await repository.seal_tape(blocked_tape_id, sealed_at_ms=_T0 + 1_000)
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_simulator_v2_book_frames_preserve_raw_evidence_and_resume_cursor() -> None:
+    settings, database_name = _settings()
+    database = Database(settings, migration_profile=MigrationProfile.SIMULATOR)
+    await connect_verified_database(database, database_name, local_only=True)
+    try:
+        await database.migrate()
+        repository = SimulationRepository(database.pool)
+        tape_id = f"tape-v2-{uuid4().hex}"
+        raw_payload = '{"lastUpdateId":101,"bids":[["99.9","2"]],"asks":[["100.1","2"]]}'
+        frame = RecordedTopNBookFrameV2(
+            source="sim-recorder-test",
+            tape_id=tape_id,
+            stream_epoch="test-epoch-1",
+            symbol="BTCUSDT",
+            tape_sequence=1,
+            exchange_update_id=101,
+            exchange_at_ms=_T0 + 60_000,
+            received_at_ms=_T0 + 60_010,
+            persisted_at_ms=_T0 + 60_020,
+            raw_payload=raw_payload,
+            raw_payload_sha256=_hash(raw_payload),
+            continuity="ADMITTED",
+            source_reason="SNAPSHOT_RECEIVED",
+            bids=(RecordedBookLevelV1(price=99.9, quantity=2.0),),
+            asks=(RecordedBookLevelV1(price=100.1, quantity=2.0),),
+        )
+
+        assert await repository.load_open_book_recording_cursor(tape_id) is None
+        assert await repository.record_book_frame(frame)
+        assert not await repository.record_book_frame(frame)
+        cursor = await repository.load_open_book_recording_cursor(tape_id)
+        assert cursor is not None
+        assert cursor.tape_id == tape_id
+        assert cursor.next_tape_sequence == 2
+        assert cursor.previous_frame_sha256 == frame.frame_sha256
+        assert cursor.symbol_cursors[0].symbol == "BTCUSDT"
+        durable = await database.pool.fetchrow(
+            """SELECT frame_contract_version, source_reason, raw_payload_text
+               FROM sim_book_frames WHERE tape_id=$1 AND tape_sequence=1""",
+            tape_id,
+        )
+        assert durable is not None
+        assert dict(durable) == {
+            "frame_contract_version": "sim-book-frame.v2",
+            "source_reason": "SNAPSHOT_RECEIVED",
+            "raw_payload_text": raw_payload,
+        }
+        with pytest.raises(asyncpg.CheckViolationError):
+            await database.pool.execute(
+                "UPDATE sim_book_frames SET source_reason=NULL WHERE tape_id=$1 AND tape_sequence=1",
+                tape_id,
+            )
+        assert await repository.verify_tape(tape_id)
     finally:
         await database.close()

@@ -17,6 +17,7 @@ import asyncpg
 from kairos_core.contracts import (
     ClosedBarEventV1,
     RecordedTopNBookFrameV1,
+    RecordedTopNBookFrameV2,
     SimulationAdmissionV2,
     SimulationBookChainHeadV1,
     SimulationChainHeadV1,
@@ -42,6 +43,7 @@ _Model = TypeVar("_Model", bound=BaseModel)
 _SimulationSymbol = Literal["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 _SimulationTradeState = Literal["PENDING", "ACTIVE", "FLAT", "UNRESOLVED", "NO_FILL", "BLOCKED"]
 _SimulationCommandStatus = Literal["PREPARED", "COMPLETED", "FAILED"]
+_RecordedBookFrame = RecordedTopNBookFrameV1 | RecordedTopNBookFrameV2
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +77,36 @@ class SimulationTradeJournal:
     next_event_seq: int
     journal_head_sha256: str | None
     events: tuple[SimulationTradeEventV2, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationBookSymbolCursor:
+    """The durable tail for one symbol in an open simulator book tape.
+
+    The recorder uses this only to resume its own deterministic continuity
+    checks.  It is not a market-data frame and carries no trading authority.
+    """
+
+    symbol: _SimulationSymbol
+    stream_epoch: str
+    exchange_update_id: int
+    exchange_at_ms: int
+    received_at_ms: int
+    persisted_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationBookRecordingCursor:
+    """Verified append position for a still-open, isolated simulator tape.
+
+    ``None`` from :meth:`load_open_book_recording_cursor` means no tape exists
+    yet.  A sealed or blocked tape is rejected rather than reopened.
+    """
+
+    tape_id: str
+    next_tape_sequence: int
+    previous_frame_sha256: str | None
+    symbol_cursors: tuple[SimulationBookSymbolCursor, ...]
 
 
 class SimulationRepository:
@@ -158,7 +190,7 @@ class SimulationRepository:
             )
         return True
 
-    async def record_book_frame(self, frame: RecordedTopNBookFrameV1) -> bool:
+    async def record_book_frame(self, frame: _RecordedBookFrame) -> bool:
         """Append a globally ordered frame and retain every source barrier."""
 
         if frame.frame_sha256 is None or frame.message_id != frame.frame_sha256:
@@ -168,7 +200,7 @@ class SimulationRepository:
             await self._tape_lock(connection, frame.tape_id)
             await self._ensure_open_tape(connection, frame.tape_id)
             existing = await connection.fetchrow(
-                """SELECT frame_sha256, payload_sha256, payload
+                """SELECT *
                    FROM sim_book_frames WHERE tape_id=$1 AND tape_sequence=$2 FOR UPDATE""",
                 frame.tape_id,
                 frame.tape_sequence,
@@ -181,9 +213,10 @@ class SimulationRepository:
                     identifier_column="frame_sha256",
                     entity="simulation book frame",
                 )
+                self._assert_book_frame_storage(existing, frame)
                 return False
             same_hash = await connection.fetchrow(
-                """SELECT frame_sha256, payload_sha256, payload
+                """SELECT *
                    FROM sim_book_frames WHERE tape_id=$1 AND frame_sha256=$2 FOR UPDATE""",
                 frame.tape_id,
                 frame.frame_sha256,
@@ -196,6 +229,7 @@ class SimulationRepository:
                     identifier_column="frame_sha256",
                     entity="simulation book frame",
                 )
+                self._assert_book_frame_storage(same_hash, frame)
                 raise MessageIdentityConflict(
                     "simulation book frame was replayed at a different tape sequence"
                 )
@@ -244,13 +278,14 @@ class SimulationRepository:
                 previous_chain_sha256=previous_chain_sha256,
                 leaf_sha256=frame.frame_sha256,
             )
+            source_reason, raw_payload_text = self._book_frame_raw_evidence(frame)
             await connection.execute(
                 """INSERT INTO sim_book_frames
                    (tape_id, tape_sequence, symbol, stream_epoch, exchange_update_id,
                     exchange_at_ms, received_at_ms, persisted_at_ms, continuity,
                     frame_sha256, previous_frame_sha256, chain_sha256, raw_payload_sha256,
-                    payload_sha256, payload)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb)""",
+                    frame_contract_version, source_reason, raw_payload_text, payload_sha256, payload)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb)""",
                 frame.tape_id,
                 frame.tape_sequence,
                 frame.symbol,
@@ -264,6 +299,9 @@ class SimulationRepository:
                 frame.previous_frame_sha256,
                 chain_sha256,
                 frame.raw_payload_sha256,
+                frame.contract_version,
+                source_reason,
+                raw_payload_text,
                 payload_sha256,
                 encoded,
             )
@@ -285,6 +323,68 @@ class SimulationRepository:
                     chain_sha256,
                 )
         return True
+
+    async def load_open_book_recording_cursor(
+        self, tape_id: str
+    ) -> SimulationBookRecordingCursor | None:
+        """Load a verified append cursor without reopening a completed tape.
+
+        The tape advisory lock makes the returned tail a coherent snapshot for
+        a single serial recorder.  The caller must still construct the next
+        frame and let :meth:`record_book_frame` enforce continuity at commit
+        time; a cursor is never an authority to bypass durable checks.
+        """
+
+        self._validate_tape_id(tape_id)
+        async with self.pool.acquire() as connection, connection.transaction():
+            await self._tape_lock(connection, tape_id)
+            tape = await connection.fetchrow(
+                "SELECT state FROM sim_tapes WHERE tape_id=$1 FOR UPDATE", tape_id
+            )
+            if tape is None:
+                return None
+            if str(tape["state"]) != "OPEN":
+                raise ValueError("simulation book recording cursor requires an open tape")
+            tail = await connection.fetchrow(
+                """SELECT * FROM sim_book_frames WHERE tape_id=$1
+                   ORDER BY tape_sequence DESC LIMIT 1 FOR UPDATE""",
+                tape_id,
+            )
+            symbol_rows = await connection.fetch(
+                """SELECT DISTINCT ON (symbol) * FROM sim_book_frames
+                   WHERE tape_id=$1
+                   ORDER BY symbol, tape_sequence DESC""",
+                tape_id,
+            )
+            symbol_cursors: list[SimulationBookSymbolCursor] = []
+            for row in symbol_rows:
+                frame = self._stored_book_frame(row)
+                symbol_cursors.append(
+                    SimulationBookSymbolCursor(
+                        symbol=cast(_SimulationSymbol, frame.symbol),
+                        stream_epoch=frame.stream_epoch,
+                        exchange_update_id=frame.exchange_update_id,
+                        exchange_at_ms=frame.exchange_at_ms,
+                        received_at_ms=frame.received_at_ms,
+                        persisted_at_ms=frame.persisted_at_ms,
+                    )
+                )
+            if tail is None:
+                return SimulationBookRecordingCursor(
+                    tape_id=tape_id,
+                    next_tape_sequence=1,
+                    previous_frame_sha256=None,
+                    symbol_cursors=(),
+                )
+            tail_frame = self._stored_book_frame(tail)
+            if tail_frame.frame_sha256 is None:
+                raise MessageIdentityConflict("simulation book tail has no immutable frame identity")
+            return SimulationBookRecordingCursor(
+                tape_id=tape_id,
+                next_tape_sequence=tail_frame.tape_sequence + 1,
+                previous_frame_sha256=tail_frame.frame_sha256,
+                symbol_cursors=tuple(sorted(symbol_cursors, key=lambda cursor: cursor.symbol)),
+            )
 
     async def seal_tape(
         self,
@@ -433,14 +533,14 @@ class SimulationRepository:
                 )
             if decision.selected_book_frame is not None:
                 frame = await connection.fetchrow(
-                    """SELECT payload_sha256, payload FROM sim_book_frames
+                    """SELECT * FROM sim_book_frames
                        WHERE tape_id=$1 AND frame_sha256=$2 FOR UPDATE""",
                     decision.session.tape_id,
                     decision.selected_book_frame.frame_sha256,
                 )
                 if frame is None:
                     raise ValueError("simulation decision selected book frame is not durably recorded")
-                self._assert_exact_model(
+                self._assert_exact_book_frame(
                     frame, decision.selected_book_frame, "simulation risk decision book frame"
                 )
             existing = await connection.fetchrow(
@@ -936,7 +1036,7 @@ class SimulationRepository:
         symbol: str,
         *,
         as_of_ms: int,
-    ) -> RecordedTopNBookFrameV1 | None:
+    ) -> _RecordedBookFrame | None:
         """Return the newest admitted, sealed-tape book no later than ``as_of_ms``.
 
         The frame's captured ``persisted_at_ms`` is the only clock used for
@@ -955,7 +1055,7 @@ class SimulationRepository:
         if str(tape["state"]) != "SEALED":
             raise ValueError("simulation book selection requires an immutable sealed tape")
         row = await self.pool.fetchrow(
-            """SELECT payload_sha256, payload FROM sim_book_frames
+            """SELECT * FROM sim_book_frames
                WHERE tape_id=$1 AND symbol=$2 AND continuity='ADMITTED'
                  AND persisted_at_ms <= $3
                ORDER BY persisted_at_ms DESC, tape_sequence DESC
@@ -966,7 +1066,7 @@ class SimulationRepository:
         )
         if row is None:
             return None
-        return self._stored_model(row, RecordedTopNBookFrameV1, "simulation book frame")
+        return self._stored_book_frame(row)
 
     async def load_command_receipt(self, command_id: str) -> SimulationCommandReceiptV1 | None:
         """Load one terminal receipt exactly as it was persisted, if any."""
@@ -1093,7 +1193,7 @@ class SimulationRepository:
             previous_chain_sha256: str | None = None
             symbol_clocks: dict[str, tuple[str, int, int, int, int]] = {}
             for row in frames:
-                frame = self._stored_model(row, RecordedTopNBookFrameV1, "simulation book frame")
+                frame = self._stored_book_frame(row)
                 frame_sha256 = frame.frame_sha256
                 if frame_sha256 is None or frame_sha256 != row["frame_sha256"]:
                     return False
@@ -1413,6 +1513,74 @@ class SimulationRepository:
             payload_sha256=payload_sha256,
             producer=_SIMULATOR_OUTBOX_PRODUCER,
         )
+
+    @staticmethod
+    def _book_frame_raw_evidence(frame: _RecordedBookFrame) -> tuple[str | None, str | None]:
+        """Return V2-only immutable recorder evidence for one insert."""
+
+        if isinstance(frame, RecordedTopNBookFrameV2):
+            return frame.source_reason, frame.raw_payload
+        return None, None
+
+    @classmethod
+    def _stored_book_frame(cls, row: asyncpg.Record) -> _RecordedBookFrame:
+        """Rehydrate a V1/V2 frame and bind its duplicate raw-evidence columns.
+
+        Payload JSON alone is not enough for V2: the separate ``TEXT`` column
+        is what retains the recorder's exact source bytes through ordinary
+        JSONB canonicalization.  Every reader verifies both representations,
+        so direct column mutation becomes a fail-closed integrity error.
+        """
+
+        payload = cls._object(row["payload"])
+        if canonical_payload(payload)[1] != row["payload_sha256"]:
+            raise MessageIdentityConflict(
+                "simulation book frame stored payload hash does not match its durable JSON"
+            )
+        version = payload.get("contract_version")
+        model_type: type[RecordedTopNBookFrameV1] | type[RecordedTopNBookFrameV2]
+        if version == "sim-book-frame.v1":
+            model_type = RecordedTopNBookFrameV1
+        elif version == "sim-book-frame.v2":
+            model_type = RecordedTopNBookFrameV2
+        else:
+            raise MessageIdentityConflict("simulation book frame has an unknown contract version")
+        try:
+            frame = model_type.model_validate(payload)
+        except Exception as exc:  # public validation errors are intentionally not a storage API
+            raise MessageIdentityConflict(
+                "simulation book frame stored payload no longer satisfies its public contract"
+            ) from exc
+        if frame.frame_sha256 is None or str(row["frame_sha256"]) != frame.frame_sha256:
+            raise MessageIdentityConflict("simulation book frame identifier does not match durable payload")
+        if str(row["raw_payload_sha256"]) != frame.raw_payload_sha256:
+            raise MessageIdentityConflict("simulation book raw payload hash does not match durable payload")
+        if str(row["frame_contract_version"]) != frame.contract_version:
+            raise MessageIdentityConflict("simulation book contract version does not match durable payload")
+        source_reason, raw_payload_text = cls._book_frame_raw_evidence(frame)
+        if row["source_reason"] != source_reason or row["raw_payload_text"] != raw_payload_text:
+            raise MessageIdentityConflict("simulation book raw evidence columns do not match durable payload")
+        return frame
+
+    @classmethod
+    def _assert_book_frame_storage(
+        cls, row: asyncpg.Record, expected: _RecordedBookFrame
+    ) -> None:
+        """Require a replayed frame to match both its public and raw evidence."""
+
+        actual = cls._stored_book_frame(row)
+        if actual != expected:
+            raise MessageIdentityConflict(
+                "simulation book frame stable ID was reused with different evidence"
+            )
+
+    @classmethod
+    def _assert_exact_book_frame(
+        cls, row: asyncpg.Record, expected: _RecordedBookFrame, entity: str
+    ) -> None:
+        actual = cls._stored_book_frame(row)
+        if actual != expected:
+            raise MessageIdentityConflict(f"{entity} stable ID was reused with a different immutable payload")
 
     @classmethod
     def _stored_model(

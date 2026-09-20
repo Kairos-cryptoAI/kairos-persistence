@@ -40,8 +40,9 @@ dependency and commit the resulting lock-file diff.
 `Database` applies an explicit topology manifest rather than every SQL file in
 the package. The default `MigrationProfile.RUNTIME` is the only profile for
 DRY_RUN and PAPER databases; it deliberately omits
-`017_simulator_journal.sql` while still allowing the later runtime outbox
-reconciliation migration. An isolated database named `kairos_sim` or
+`017_simulator_journal.sql` and `019_simulator_book_frame_v2.sql` while still
+allowing the later runtime outbox reconciliation migration. An isolated
+database named `kairos_sim` or
 `kairos_sim_<suffix>` must opt into `MigrationProfile.SIMULATOR` explicitly;
 that profile cannot target a runtime/PAPER database, and the runtime profile
 cannot target the simulator name. A database history that mixes the two

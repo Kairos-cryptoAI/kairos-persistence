@@ -48,6 +48,8 @@ from .repository import (
 from .runtime import DurableMessageBus, canonical_payload
 from .runtime_health import ExecutionRuntimeHealth, ExecutionRuntimeHealthRepository
 from .simulation_repository import (
+    SimulationBookRecordingCursor,
+    SimulationBookSymbolCursor,
     SimulationCommandCompletion,
     SimulationCommandPreparation,
     SimulationJournalRepository,
@@ -98,6 +100,8 @@ __all__ = [
     "ExecutionRuntimeHealthRepository",
     "SimulationRepository",
     "SimulationJournalRepository",
+    "SimulationBookRecordingCursor",
+    "SimulationBookSymbolCursor",
     "SimulationCommandPreparation",
     "SimulationCommandCompletion",
     "SimulationTradeJournal",
