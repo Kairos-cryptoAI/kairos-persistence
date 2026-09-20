@@ -2,7 +2,7 @@
 
 from .canary_arm import PaperCanaryArm, PaperCanaryArmRepository
 from .config import PersistenceSettings
-from .database import Database
+from .database import Database, MigrationProfile
 from .execution_journal import (
     EffectPreparation,
     EffectStatus,
@@ -86,6 +86,7 @@ __all__ = [
     "CampaignLLMUsageBudget",
     "AuditRepository",
     "Database",
+    "MigrationProfile",
     "DurableMessageBus",
     "DurableLLMUsageBudget",
     "EffectStatus",

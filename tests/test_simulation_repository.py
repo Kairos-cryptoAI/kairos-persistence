@@ -44,7 +44,7 @@ from kairos_core import (
     StrategyProvenanceV1,
 )
 
-from kairos_persistence import Database, PersistenceSettings, SimulationRepository
+from kairos_persistence import Database, MigrationProfile, PersistenceSettings, SimulationRepository
 from kairos_persistence.database_target import connect_verified_database, require_database_target_url
 
 _T0 = 1_800_000_000_000
@@ -197,7 +197,7 @@ def test_simulator_target_rejects_runtime_or_unqualified_database_names() -> Non
 @pytest.mark.asyncio
 async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_inputs() -> None:
     settings, database_name = _settings()
-    database = Database(settings)
+    database = Database(settings, migration_profile=MigrationProfile.SIMULATOR)
     await connect_verified_database(database, database_name, local_only=True)
     try:
         await database.migrate()

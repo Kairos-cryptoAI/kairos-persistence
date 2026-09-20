@@ -35,6 +35,28 @@ with Make installed. On Windows, run the `uv` commands directly.
 `pyproject.toml` and `uv.lock`. Run `uv lock` deliberately when updating any
 dependency and commit the resulting lock-file diff.
 
+## Migration profiles
+
+`Database` applies an explicit topology manifest rather than every SQL file in
+the package. The default `MigrationProfile.RUNTIME` is the only profile for
+DRY_RUN and PAPER databases; it deliberately omits
+`017_simulator_journal.sql` while still allowing the later runtime outbox
+reconciliation migration. An isolated database named `kairos_sim` or
+`kairos_sim_<suffix>` must opt into `MigrationProfile.SIMULATOR` explicitly;
+that profile cannot target a runtime/PAPER database, and the runtime profile
+cannot target the simulator name. A database history that mixes the two
+profiles is rejected before additional DDL is applied.
+
+```python
+from kairos_persistence import Database, MigrationProfile
+
+runtime_database = Database()  # explicit safe default: MigrationProfile.RUNTIME
+simulator_database = Database(migration_profile=MigrationProfile.SIMULATOR)
+```
+
+This separation is a topology boundary, not a readiness grant: simulator rows
+remain `SIMULATED` and cannot qualify PAPER, alpha, or LIVE.
+
 ## TimescaleDB integration tests
 
 Start a TimescaleDB 2.28.3 / PostgreSQL 16 instance and set the test DSN:
