@@ -280,7 +280,7 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
 
         intent = _intent(bars["BTCUSDT"])
         review = _review(intent)
-        unrecorded_intent = _intent(_bar("BTCUSDT", open_time_ms=_T0 + 60_000))
+        unrecorded_intent = _intent(_bar("BTCUSDT", open_time_ms=_T0 + 120_000))
         unrecorded_review = _review(unrecorded_intent)
         unrecorded_decision = SimulationRiskDecisionV1(
             source="simulation-risk-test",
