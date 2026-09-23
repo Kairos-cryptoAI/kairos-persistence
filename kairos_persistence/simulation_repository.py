@@ -1066,6 +1066,95 @@ class SimulationRepository:
             return None
         return self._stored_book_frame(row)
 
+    async def load_closed_bar_page(
+        self,
+        tape_id: str,
+        symbol: str,
+        *,
+        after_open_time_ms: int | None = None,
+        limit: int = 1_000,
+    ) -> tuple[ClosedBarEventV1, ...]:
+        """Read a bounded, ordered page from one sealed SIM tape.
+
+        Replay callers must first run :meth:`verify_tape` for the immutable
+        tape. This method then checks every returned row's canonical payload
+        and bar identity, and requires a supplied cursor to be an exact stored
+        bar boundary so pagination cannot silently jump over a gap.
+        """
+
+        self._validate_tape_id(tape_id)
+        if symbol not in _SYMBOLS:
+            raise ValueError("simulation bar selection is outside the fixed five-symbol universe")
+        if after_open_time_ms is not None:
+            self._validate_timestamp("after_open_time_ms", after_open_time_ms)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise ValueError("simulation bar page limit must be an integer from 1 through 10000")
+
+        async with (
+            self.pool.acquire() as connection,
+            connection.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            tape = await connection.fetchrow(
+                "SELECT state, tape_sha256 FROM sim_tapes WHERE tape_id=$1", tape_id
+            )
+            if tape is None:
+                raise KeyError(f"unknown simulation tape {tape_id!r}")
+            if tape["state"] != "SEALED" or tape["tape_sha256"] is None:
+                raise ValueError("simulation bar replay requires an immutable sealed tape")
+
+            previous_close_time_ms: int | None = None
+            if after_open_time_ms is not None:
+                cursor = await connection.fetchrow(
+                    """SELECT symbol, open_time_ms, close_time_ms, bar_sha256, payload_sha256, payload
+                       FROM sim_closed_bars
+                       WHERE tape_id=$1 AND symbol=$2 AND open_time_ms=$3""",
+                    tape_id,
+                    symbol,
+                    after_open_time_ms,
+                )
+                if cursor is None:
+                    raise ValueError("simulation bar page cursor is not a stored bar boundary")
+                previous = self._stored_model(cursor, ClosedBarEventV1, "simulation closed bar cursor")
+                if (
+                    previous.symbol != symbol
+                    or previous.symbol != str(cursor["symbol"])
+                    or previous.open_time_ms != int(cursor["open_time_ms"])
+                    or previous.close_time_ms != int(cursor["close_time_ms"])
+                    or previous.bar_sha256 != cursor["bar_sha256"]
+                ):
+                    raise MessageIdentityConflict(
+                        "simulation bar page cursor identity does not match its row"
+                    )
+                previous_close_time_ms = previous.close_time_ms
+
+            rows = await connection.fetch(
+                """SELECT symbol, open_time_ms, close_time_ms, bar_sha256, payload_sha256, payload
+                   FROM sim_closed_bars
+                   WHERE tape_id=$1 AND symbol=$2
+                     AND ($3::bigint IS NULL OR open_time_ms > $3)
+                   ORDER BY open_time_ms
+                   LIMIT $4""",
+                tape_id,
+                symbol,
+                after_open_time_ms,
+                limit,
+            )
+
+        bars = tuple(self._stored_model(row, ClosedBarEventV1, "simulation closed bar") for row in rows)
+        for bar, row in zip(bars, rows, strict=True):
+            if (
+                bar.symbol != symbol
+                or bar.symbol != str(row["symbol"])
+                or bar.open_time_ms != int(row["open_time_ms"])
+                or bar.close_time_ms != int(row["close_time_ms"])
+                or bar.bar_sha256 != row["bar_sha256"]
+            ):
+                raise MessageIdentityConflict("simulation closed bar identity does not match its tape row")
+            if previous_close_time_ms is not None and bar.open_time_ms != previous_close_time_ms + 1:
+                raise MessageIdentityConflict("simulation closed bar page is not a contiguous tape prefix")
+            previous_close_time_ms = bar.close_time_ms
+        return bars
+
     async def load_command_receipt(self, command_id: str) -> SimulationCommandReceiptV1 | None:
         """Load one terminal receipt exactly as it was persisted, if any."""
 
@@ -1158,7 +1247,13 @@ class SimulationRepository:
             for row in bars:
                 bar = self._stored_model(row, ClosedBarEventV1, "simulation closed bar")
                 bar_sha256 = bar.bar_sha256
-                if bar_sha256 is None or bar_sha256 != row["bar_sha256"]:
+                if (
+                    bar_sha256 is None
+                    or bar_sha256 != row["bar_sha256"]
+                    or bar.symbol != str(row["symbol"])
+                    or bar.open_time_ms != int(row["open_time_ms"])
+                    or bar.close_time_ms != int(row["close_time_ms"])
+                ):
                     return False
                 symbol = str(row["symbol"])
                 previous = previous_by_symbol.get(symbol)

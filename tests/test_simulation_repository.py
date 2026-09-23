@@ -209,6 +209,9 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
         for bar in bars.values():
             assert await repository.record_closed_bar(tape_id, bar)
         assert not await repository.record_closed_bar(tape_id, bars["BTCUSDT"])
+        following_bars = {symbol: _bar(symbol, open_time_ms=_T0 + 60_000) for symbol in _SYMBOLS}
+        for bar in following_bars.values():
+            assert await repository.record_closed_bar(tape_id, bar)
 
         frames: dict[str, RecordedTopNBookFrameV1] = {}
         previous_frame_sha256: str | None = None
@@ -236,6 +239,30 @@ async def test_simulator_journal_is_idempotent_and_replays_only_sealed_recorded_
         seal = await repository.seal_tape(tape_id, sealed_at_ms=_T0 + 130_000)
         assert seal.execution_environment == "SIMULATED"
         assert await repository.verify_tape(tape_id)
+        first_page = await repository.load_closed_bar_page(tape_id, "BTCUSDT", limit=1)
+        assert first_page == (bars["BTCUSDT"],)
+        next_page = await repository.load_closed_bar_page(
+            tape_id,
+            "BTCUSDT",
+            after_open_time_ms=first_page[-1].open_time_ms,
+            limit=10,
+        )
+        assert next_page == (following_bars["BTCUSDT"],)
+        assert (
+            await repository.load_closed_bar_page(
+                tape_id,
+                "BTCUSDT",
+                after_open_time_ms=next_page[-1].open_time_ms,
+                limit=10,
+            )
+            == ()
+        )
+        with pytest.raises(ValueError, match="stored bar boundary"):
+            await repository.load_closed_bar_page(
+                tape_id,
+                "BTCUSDT",
+                after_open_time_ms=_T0 + 30_000,
+            )
 
         session = SimulationSessionV1(
             source="market-simulator-test",
