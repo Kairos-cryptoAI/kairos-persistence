@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -13,14 +14,18 @@ from kairos_core import (
     LLMProposalAction,
     LLMProposalModelProvenanceV1,
     LLMTradeProposalV1,
+    Topics,
 )
+from kairos_core.bus.base import BusEnvelope, MessageBus
 
 from kairos_persistence import (
+    SIMULATOR_PROPOSAL_CONSUMER_GROUP,
     Database,
     MessageIdentityConflict,
     MigrationProfile,
     PersistenceSettings,
     SimulatorProposalRepository,
+    consume_simulator_proposals,
 )
 from kairos_persistence.database_target import connect_verified_database, require_database_target_url
 
@@ -106,6 +111,99 @@ def test_simulator_repository_never_falls_back_to_a_runtime_target() -> None:
             PersistenceSettings(database_url="postgresql://kairos:test@localhost:5432/kairos"),
             migration_profile=MigrationProfile.SIMULATOR,
         )
+
+
+class _QueueMessageBus(MessageBus):
+    def __init__(self) -> None:
+        self.messages: asyncio.Queue[BusEnvelope] = asyncio.Queue()
+        self.subscribed = asyncio.Event()
+        self.acknowledged: list[tuple[str, str, str | None]] = []
+        self.subscription: tuple[str, str | None, str | None] | None = None
+
+    async def publish(self, topic: str, message) -> str:
+        payload = self._to_payload(message)
+        envelope = BusEnvelope(id=f"message-{self.messages.qsize() + 1}", topic=topic, payload=payload)
+        await self.messages.put(envelope)
+        return envelope.id
+
+    async def subscribe(self, topic: str, *, group: str | None = None, consumer: str | None = None):
+        self.subscription = (topic, group, consumer)
+        self.subscribed.set()
+        while True:
+            yield await self.messages.get()
+
+    async def ack(self, topic: str, envelope: BusEnvelope, *, group: str | None = None) -> None:
+        self.acknowledged.append((topic, envelope.id, group))
+
+
+class _RecordingProposalRepository(SimulatorProposalRepository):
+    def __init__(self, *, fail: Exception | None = None) -> None:
+        self.proposals: list[LLMTradeProposalV1] = []
+        self.recorded = asyncio.Event()
+        self.fail = fail
+
+    async def record(self, proposal: LLMTradeProposalV1) -> bool:
+        if self.fail is not None:
+            raise self.fail
+        self.proposals.append(proposal)
+        self.recorded.set()
+        return True
+
+
+@pytest.mark.asyncio
+async def test_consumer_records_advisory_proposal_before_acknowledging() -> None:
+    repository = _RecordingProposalRepository()
+    bus = _QueueMessageBus()
+    proposal = _proposal()
+    task = asyncio.create_task(consume_simulator_proposals(repository, bus, consumer="simulator-test-worker"))
+    await asyncio.wait_for(bus.subscribed.wait(), timeout=1)
+    message_id = await bus.publish(Topics.LLM_TRADE_PROPOSAL, proposal)
+    await asyncio.wait_for(repository.recorded.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert bus.subscription == (
+        Topics.LLM_TRADE_PROPOSAL,
+        SIMULATOR_PROPOSAL_CONSUMER_GROUP,
+        "simulator-test-worker",
+    )
+    assert repository.proposals == [proposal]
+    assert bus.acknowledged == [(Topics.LLM_TRADE_PROPOSAL, message_id, SIMULATOR_PROPOSAL_CONSUMER_GROUP)]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_consumer_fails_closed_without_ack_on_invalid_or_unpersistable_message() -> None:
+    bus = _QueueMessageBus()
+    invalid_repository = _RecordingProposalRepository()
+    invalid_task = asyncio.create_task(
+        consume_simulator_proposals(invalid_repository, bus, consumer="simulator-test-worker")
+    )
+    await asyncio.wait_for(bus.subscribed.wait(), timeout=1)
+    await bus.publish(Topics.LLM_TRADE_PROPOSAL, {"unexpected": "payload"})
+    with pytest.raises(ValueError):
+        await asyncio.wait_for(invalid_task, timeout=1)
+    assert bus.acknowledged == []
+
+    bus = _QueueMessageBus()
+    storage_error = RuntimeError("synthetic storage failure")
+    repository = _RecordingProposalRepository(fail=storage_error)
+    task = asyncio.create_task(consume_simulator_proposals(repository, bus, consumer="worker-2"))
+    await asyncio.wait_for(bus.subscribed.wait(), timeout=1)
+    await bus.publish(Topics.LLM_TRADE_PROPOSAL, _proposal())
+    with pytest.raises(RuntimeError, match="synthetic storage failure"):
+        await asyncio.wait_for(task, timeout=1)
+    assert bus.acknowledged == []
+
+
+def test_consumer_rejects_unsafe_identity_before_subscribing() -> None:
+    repository = _RecordingProposalRepository()
+    bus = _QueueMessageBus()
+    with pytest.raises(ValueError, match="normalized non-empty identifier"):
+        asyncio.run(consume_simulator_proposals(repository, bus, consumer=" "))
+    assert bus.subscription is None
 
 
 @pytest.mark.asyncio
