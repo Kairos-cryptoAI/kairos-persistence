@@ -215,7 +215,12 @@ TimescaleDB through `KAIROS_PERSISTENCE_DATABASE_URL`, and reports connectivity,
 pending/dead-lettered outbox rows, processing/failed inbox rows, unresolved/failed
 execution effects, and the oldest unpublished message age. The exporter performs
 read-only queries and an authenticated Redis `PING`; database or Redis failure is
-returned as a zero health gauge rather than fabricated healthy metrics.
+returned as a zero health gauge rather than fabricated healthy metrics. Its
+PostgreSQL pool sets `default_transaction_read_only=on`, and startup verifies the
+exact runtime migration history in a read-only transaction. It never runs
+`Database.migrate()`; missing or mismatched schema history fails startup before
+the metrics listener opens. This protection is specific to the observer and does
+not change migration behavior for the runtime services that own schema setup.
 
 Venue availability is derived from strict `kairos.venue.poll.v1` attempt and
 terminal-outcome facts. The denominator is the full 24-hour slot count for the

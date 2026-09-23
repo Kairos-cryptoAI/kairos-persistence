@@ -64,8 +64,10 @@ class Database:
         settings: PersistenceSettings | None = None,
         *,
         migration_profile: MigrationProfile | str = MigrationProfile.RUNTIME,
+        read_only: bool = False,
     ) -> None:
         self.settings = settings or PersistenceSettings()
+        self.read_only = read_only
         try:
             self.migration_profile = MigrationProfile(migration_profile)
         except ValueError as exc:
@@ -131,11 +133,15 @@ class Database:
     async def connect(self) -> None:
         if self._pool is not None:
             return
+        pool_options: dict[str, object] = {}
+        if self.read_only:
+            pool_options["server_settings"] = {"default_transaction_read_only": "on"}
         pool = await asyncpg.create_pool(
             dsn=self.settings.database_url,
             min_size=self.settings.pool_min_size,
             max_size=self.settings.pool_max_size,
             command_timeout=self.settings.command_timeout_s,
+            **pool_options,
         )
         try:
             current_database = await pool.fetchval("SELECT current_database()")
@@ -159,6 +165,9 @@ class Database:
 
     async def migrate(self) -> None:
         """Apply only the immutable migrations allowed by this topology."""
+
+        if self.read_only:
+            raise RuntimeError("read-only database connections cannot apply migrations")
 
         migration_paths = {
             path.name: path for path in Path(__file__).with_name("migrations").glob("[0-9][0-9][0-9]_*.sql")
@@ -195,3 +204,16 @@ class Database:
                     "database migration history changed outside the selected "
                     f"{self.migration_profile.value} profile"
                 )
+
+    async def verify_schema(self) -> None:
+        """Verify the exact selected migration profile without changing the database."""
+
+        expected = self.migration_names(self.migration_profile)
+        async with self.pool.acquire() as connection:
+            async with connection.transaction(readonly=True):
+                rows = await connection.fetch("SELECT version FROM schema_migrations ORDER BY version")
+        applied = tuple(str(row["version"]) for row in rows)
+        if applied != expected:
+            raise RuntimeError(
+                f"database migration history does not match the exact {self.migration_profile.value} profile"
+            )

@@ -662,39 +662,43 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
 
 
 async def run_exporter(*, host: str, port: int, redis_url: str) -> None:
-    database = Database(PersistenceSettings())
+    # Observation must never run schema DDL.  Keep the exporter query-only and
+    # fail closed when the database is not at the exact runtime schema profile.
+    database = Database(PersistenceSettings(), read_only=True)
     await database.connect()
-    await database.migrate()
-
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            request = await asyncio.wait_for(reader.readline(), timeout=5)
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=5)
-                if line in {b"\r\n", b"\n", b""}:
-                    break
-            if not request.startswith(b"GET /metrics "):
-                body = b"not found\n"
-                status = b"HTTP/1.1 404 Not Found\r\n"
-            else:
-                body = render_prometheus(await collect_runtime_metrics(database.pool, redis_url=redis_url))
-                status = b"HTTP/1.1 200 OK\r\n"
-            writer.write(
-                status
-                + b"Content-Type: text/plain; version=0.0.4\r\n"
-                + f"Content-Length: {len(body)}\r\n".encode()
-                + b"Connection: close\r\n\r\n"
-                + body
-            )
-            await writer.drain()
-        except (ConnectionError, TimeoutError):
-            pass
-        finally:
-            writer.close()
-            await writer.wait_closed()
-
-    server = await asyncio.start_server(handle, host=host, port=port)
     try:
+        await database.verify_schema()
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                request = await asyncio.wait_for(reader.readline(), timeout=5)
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), timeout=5)
+                    if line in {b"\r\n", b"\n", b""}:
+                        break
+                if not request.startswith(b"GET /metrics "):
+                    body = b"not found\n"
+                    status = b"HTTP/1.1 404 Not Found\r\n"
+                else:
+                    body = render_prometheus(
+                        await collect_runtime_metrics(database.pool, redis_url=redis_url)
+                    )
+                    status = b"HTTP/1.1 200 OK\r\n"
+                writer.write(
+                    status
+                    + b"Content-Type: text/plain; version=0.0.4\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                )
+                await writer.drain()
+            except (ConnectionError, TimeoutError):
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(handle, host=host, port=port)
         async with server:
             await server.serve_forever()
     finally:
