@@ -56,6 +56,7 @@ from .simulation_repository import (
     SimulationRepository,
     SimulationTradeJournal,
 )
+from .simulator_proposals import SimulatorProposalRepository
 from .source_state import (
     CAMPAIGN_PROVIDER_CAPS,
     QUALIFICATION_CAMPAIGN_ID,
@@ -105,6 +106,7 @@ __all__ = [
     "SimulationCommandPreparation",
     "SimulationCommandCompletion",
     "SimulationTradeJournal",
+    "SimulatorProposalRepository",
     "ExecutionMutationBudgetRepository",
     "ExecutionMutationReservation",
     "DEFAULT_COMPENSATION_RESERVE",

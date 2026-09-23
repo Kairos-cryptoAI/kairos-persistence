@@ -48,6 +48,7 @@ _SIMULATOR_MIGRATIONS = _RUNTIME_MIGRATIONS[:-1] + (
     "017_simulator_journal.sql",
     _RUNTIME_MIGRATIONS[-1],
     "019_simulator_book_frame_v2.sql",
+    "020_simulator_llm_proposals.sql",
 )
 _MIGRATION_MANIFESTS: dict[MigrationProfile, tuple[str, ...]] = {
     MigrationProfile.RUNTIME: _RUNTIME_MIGRATIONS,
