@@ -45,6 +45,7 @@ from .repository import (
     OfflineOutboxQuarantineState,
     OutboxRecord,
 )
+from .research_decision_samples import ResearchDecisionSampleRepository
 from .runtime import DurableMessageBus, canonical_payload
 from .runtime_health import ExecutionRuntimeHealth, ExecutionRuntimeHealthRepository
 from .simulation_repository import (
@@ -111,6 +112,7 @@ __all__ = [
     "SimulationCommandCompletion",
     "SimulationTradeJournal",
     "SimulatorProposalRepository",
+    "ResearchDecisionSampleRepository",
     "SIMULATOR_PROPOSAL_CONSUMER_GROUP",
     "consume_simulator_proposals",
     "ExecutionMutationBudgetRepository",

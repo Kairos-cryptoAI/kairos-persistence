@@ -542,7 +542,7 @@ wheels = [
 [[package]]
 name = "kairos-core"
 version = "0.3.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=0c8717c18d535465ae89c51bcd958b0884ec02ab#0c8717c18d535465ae89c51bcd958b0884ec02ab" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=9c8659545218147ae181cac04d22a68b5a6549ef#9c8659545218147ae181cac04d22a68b5a6549ef" }
 dependencies = [
     { name = "aiohttp" },
     { name = "orjson" },
@@ -581,7 +581,7 @@ dev = [
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.29,<1" },
     { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=0c8717c18d535465ae89c51bcd958b0884ec02ab" },
+    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=9c8659545218147ae181cac04d22a68b5a6549ef" },
     { name = "pydantic-settings", specifier = ">=2.2,<3" },
     { name = "structlog", specifier = ">=24.1,<27" },
     { name = "uvicorn", specifier = ">=0.30,<1" },

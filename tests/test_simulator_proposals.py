@@ -78,6 +78,13 @@ def _simulator_database(*, read_only: bool = False) -> Database:
     )
 
 
+@pytest.mark.asyncio
+async def test_record_rejects_noncanonical_copied_proposal_before_connecting() -> None:
+    repository = SimulatorProposalRepository(_simulator_database())
+    with pytest.raises(ValueError, match="ID does not match its canonical payload"):
+        await repository.record(_proposal().model_copy(update={"rationale": "forged"}))
+
+
 def test_proposal_migration_is_simulator_only_and_append_only() -> None:
     runtime = Database.migration_names(MigrationProfile.RUNTIME)
     simulator = Database.migration_names(MigrationProfile.SIMULATOR)
@@ -86,7 +93,7 @@ def test_proposal_migration_is_simulator_only_and_append_only() -> None:
     ).read_text(encoding="utf-8")
 
     assert "020_simulator_llm_proposals.sql" not in runtime
-    assert simulator[-1] == "020_simulator_llm_proposals.sql"
+    assert "020_simulator_llm_proposals.sql" in simulator
     assert "UNIQUE (campaign_id, arm_id, sample_id)" in sql
     assert "BEFORE UPDATE OR DELETE" in sql
     assert "BEFORE TRUNCATE" in sql
@@ -238,9 +245,22 @@ async def test_proposals_are_idempotent_immutable_and_paged_only_from_simulator_
             expires_at_ts_ms=_T0 + 120_000,
             market_snapshot_sha256="5" * 64,
         )
+        alert = _proposal(
+            sample_id="sample-0003",
+            market_as_of_ts_ms=_T0 + 120_000,
+            expires_at_ts_ms=_T0 + 180_000,
+            market_snapshot_sha256="6" * 64,
+            action=LLMProposalAction.VOLATILITY_ALERT,
+        )
         assert await repository.record(proposal)
         assert not await repository.record(proposal)
         assert await repository.record(second)
+        assert await repository.record(alert)
+        assert (await repository.load_page(campaign_id=proposal.campaign_id, arm_id=proposal.arm_id)) == (
+            proposal,
+            second,
+            alert,
+        )
 
         changed_same_sample = _proposal(rationale="A changed result for an already sealed sample.")
         with pytest.raises(MessageIdentityConflict, match="different immutable"):

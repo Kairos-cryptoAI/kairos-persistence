@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from kairos_core import LLMTradeProposalV1
+from kairos_core import LLMTradeProposalV1, canonical_sha256
 
 from .database import Database, MigrationProfile
 from .repository import MessageIdentityConflict
@@ -37,6 +37,8 @@ class SimulatorProposalRepository:
         proposal_id = proposal.proposal_id
         if proposal_id is None:  # impossible after contract validation
             raise ValueError("LLM proposal is missing its canonical ID")
+        if proposal_id != canonical_sha256(proposal.identity_payload()):
+            raise ValueError("LLM proposal ID does not match its canonical payload")
         payload = proposal.to_payload()
         encoded, payload_sha256 = canonical_payload(payload)
 

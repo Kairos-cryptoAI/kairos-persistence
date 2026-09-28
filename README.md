@@ -48,6 +48,19 @@ that profile cannot target a runtime/PAPER database, and the runtime profile
 cannot target the simulator name. A database history that mixes the two
 profiles is rejected before additional DDL is applied.
 
+The simulator profile also owns `020_simulator_llm_proposals.sql` and
+`021_simulator_research_decision_samples.sql`. The latter stores one immutable
+`ResearchDecisionSampleV1` per campaign/arm/scheduled sample, including both
+strategy and LLM outcomes when present. An evaluated no-intent requires an
+evaluation receipt; `NOT_EVALUATED` and `NOT_CALLED` are distinct from that
+fact. An LLM volatility alert and a failed attempted call remain separate
+non-executable outcomes. A completed LLM proposal carries a separately linked
+completion receipt and observed response time; a late answer cannot be paired
+as if it was available at the scheduled decision. `ResearchDecisionSampleRepository` accepts exact
+redelivery, rejects changed facts for the same sample, and loads bounded
+integrity-checked pages. The repository does not itself verify the external
+source objects named by receipt hashes. Neither table grants execution authority.
+
 ```python
 from kairos_persistence import Database, MigrationProfile
 
