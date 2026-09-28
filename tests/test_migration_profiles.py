@@ -54,13 +54,14 @@ def test_runtime_profile_skips_the_simulator_only_journal_but_includes_outbox_qu
 def test_simulator_profile_is_the_only_profile_that_owns_simulator_migrations() -> None:
     names = Database.migration_names(MigrationProfile.SIMULATOR)
 
-    assert names[-4:] == (
+    assert names[-5:] == (
         "018_offline_outbox_reconciliation.sql",
         "019_simulator_book_frame_v2.sql",
         "020_simulator_llm_proposals.sql",
         "021_simulator_research_decision_samples.sql",
+        "022_simulator_research_observation_schedule.sql",
     )
-    assert names[-5] == "017_simulator_journal.sql"
+    assert names[-6] == "017_simulator_journal.sql"
     assert set(Database.migration_names(MigrationProfile.RUNTIME)).issubset(set(names))
 
 
