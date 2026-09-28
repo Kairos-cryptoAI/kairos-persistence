@@ -98,6 +98,23 @@ def _sample(
     return ResearchDecisionSampleV1(**values)
 
 
+def _long_sample(
+    schedule: ResearchObservationScheduleV1,
+    arm_id: str,
+    sample_id: str,
+) -> ResearchDecisionSampleV1:
+    sample = _sample(schedule, arm_id, sample_id)
+    return ResearchDecisionSampleV1.model_validate(
+        {
+            **sample.to_payload(),
+            "sample_record_id": None,
+            "strategy_outcome": "LONG",
+            "strategy_intent_id": "a" * 64,
+            "strategy_intent_expires_at_ts_ms": sample.sample_deadline_ts_ms + 1_000,
+        }
+    )
+
+
 def _simulator_database(*, read_only: bool = False) -> Database:
     return Database(
         PersistenceSettings(
@@ -117,9 +134,19 @@ def test_roster_migration_is_sim_only_and_freezes_all_three_arms() -> None:
         / "migrations"
         / "022_simulator_research_observation_schedule.sql"
     ).read_text(encoding="utf-8")
+    lineage_sql = (
+        Path(__file__).parents[1]
+        / "kairos_persistence"
+        / "migrations"
+        / "023_simulator_research_baseline_lineage.sql"
+    ).read_text(encoding="utf-8")
 
     assert "022_simulator_research_observation_schedule.sql" not in runtime
-    assert simulator[-1] == "022_simulator_research_observation_schedule.sql"
+    assert "023_simulator_research_baseline_lineage.sql" not in runtime
+    assert simulator[-2:] == (
+        "022_simulator_research_observation_schedule.sql",
+        "023_simulator_research_baseline_lineage.sql",
+    )
     assert "sim_research_observation_schedules" in sql
     assert "sim_research_observation_windows" in sql
     assert "sim_research_coverage_seals" in sql
@@ -130,6 +157,18 @@ def test_roster_migration_is_sim_only_and_freezes_all_three_arms() -> None:
     assert "BEFORE TRUNCATE" in sql
     assert all(arm in sql for arm in RESEARCH_ARMS)
     assert "paper_" not in sql and "execution_" not in sql
+    assert "CREATE OR REPLACE FUNCTION simulator_guard_scheduled_research_sample()" in lineage_sql
+    for field in (
+        "market_snapshot_sha256",
+        "strategy_outcome",
+        "strategy_evaluation_sha256",
+        "strategy_evidence_as_of_ts_ms",
+        "strategy_market_snapshot_sha256",
+        "strategy_intent_id",
+        "strategy_intent_expires_at_ts_ms",
+    ):
+        assert f"prior.{field} IS DISTINCT FROM NEW.{field}" in lineage_sql
+    assert "paper_" not in lineage_sql and "execution_" not in lineage_sql
 
 
 def test_repository_rejects_runtime_readonly_and_untyped_roster() -> None:
@@ -223,9 +262,31 @@ async def test_preregistered_sim_roster_guards_results_and_seals_exhaustive_cove
         with pytest.raises(asyncpg.PostgresError, match="frozen window"):
             await samples.record(wrong_snapshot)
 
-        for window in schedule.windows:
-            for arm in RESEARCH_ARMS:
-                assert await samples.record(_sample(schedule, arm, window.sample_id))
+        assert await samples.record(_sample(schedule, "strategy-only", "sample-001"))
+        changed_evaluation = ResearchDecisionSampleV1.model_validate(
+            {
+                **_sample(schedule, "strategy-review", "sample-001").to_payload(),
+                "sample_record_id": None,
+                "strategy_evaluation_sha256": "f" * 64,
+            }
+        )
+        with pytest.raises(asyncpg.PostgresError, match="baseline strategy lineage"):
+            await samples.record(changed_evaluation)
+        for arm in RESEARCH_ARMS[1:]:
+            assert await samples.record(_sample(schedule, arm, "sample-001"))
+
+        assert await samples.record(_long_sample(schedule, "strategy-only", "sample-002"))
+        changed_intent = ResearchDecisionSampleV1.model_validate(
+            {
+                **_long_sample(schedule, "strategy-review", "sample-002").to_payload(),
+                "sample_record_id": None,
+                "strategy_intent_id": "f" * 64,
+            }
+        )
+        with pytest.raises(asyncpg.PostgresError, match="baseline strategy lineage"):
+            await samples.record(changed_intent)
+        for arm in RESEARCH_ARMS[1:]:
+            assert await samples.record(_long_sample(schedule, arm, "sample-002"))
         seal = await roster.seal_coverage(campaign_id=schedule.campaign_id)
         assert seal.expected_result_count == len(schedule.windows) * 3
         assert seal.schedule_digest == schedule.schedule_digest
@@ -238,5 +299,70 @@ async def test_preregistered_sim_roster_guards_results_and_seals_exhaustive_cove
         assert await samples.record(_sample(late_schedule, "strategy-only", "sample-001"))
         with pytest.raises(MessageIdentityConflict, match="already has arm results"):
             await roster.register(late_schedule)
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_023_rejects_preexisting_mismatched_arms_even_for_a_sealed_022_campaign() -> None:
+    database_url = os.getenv("KAIROS_SIM_UPGRADE_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("KAIROS_SIM_UPGRADE_TEST_DATABASE_URL is required for isolated 022 upgrade test")
+    database_name = urlsplit(database_url).path.removeprefix("/")
+    if not (
+        database_name.startswith("kairos_sim_test_upgrade_")
+        and _SIMPLE_DATABASE_NAME.fullmatch(database_name)
+    ):
+        raise RuntimeError("022 upgrade test requires a uniquely named disposable kairos_sim_test_upgrade DB")
+    require_database_target_url(database_url, database_name, local_only=True)
+    database = Database(
+        PersistenceSettings(database_url=database_url), migration_profile=MigrationProfile.SIMULATOR
+    )
+    await connect_verified_database(database, database_name, local_only=True)
+    try:
+        migrations = Path(__file__).parents[1] / "kairos_persistence" / "migrations"
+        old_profile = Database.migration_names(MigrationProfile.SIMULATOR)[:-1]
+        assert old_profile[-1] == "022_simulator_research_observation_schedule.sql"
+        async with database.transaction() as connection:
+            await connection.execute("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY)")
+            for name in old_profile:
+                await connection.execute((migrations / name).read_text(encoding="utf-8"))
+                await connection.execute("INSERT INTO schema_migrations(version) VALUES ($1)", name)
+
+        roster = ResearchObservationScheduleRepository(database)
+        samples = ResearchDecisionSampleRepository(database)
+        schedule = _schedule(f"upgrade-{uuid4().hex[:16]}")
+        assert await roster.register(schedule)
+        assert await samples.record(_sample(schedule, "strategy-only", "sample-001"))
+        drifted = ResearchDecisionSampleV1.model_validate(
+            {
+                **_sample(schedule, "strategy-review", "sample-001").to_payload(),
+                "sample_record_id": None,
+                "strategy_evaluation_sha256": "f" * 64,
+            }
+        )
+        assert await samples.record(drifted)  # 022 accepted this invalid matched baseline.
+        await database.pool.execute(
+            """INSERT INTO sim_research_coverage_seals
+               (campaign_id, coverage_digest, schedule_digest, expected_result_count,
+                result_ids_sha256, authority, payload, payload_sha256)
+               VALUES ($1,$2,$3,3,$4,'SIM_RESEARCH_ONLY',$5::jsonb,$6)""",
+            schedule.campaign_id,
+            "e" * 64,
+            schedule.schedule_digest,
+            "f" * 64,
+            '{"synthetic_022_only_test": true}',
+            "d" * 64,
+        )
+
+        with pytest.raises(asyncpg.PostgresError, match="preexisting scheduled SIM research arms disagree"):
+            await database.migrate()
+        rows = await database.pool.fetch("SELECT version FROM schema_migrations ORDER BY version")
+        assert tuple(str(row["version"]) for row in rows) == old_profile
+        old_guard = await database.pool.fetchval(
+            "SELECT pg_get_functiondef('simulator_guard_scheduled_research_sample()'::regprocedure)"
+        )
+        assert "prior.strategy_evaluation_sha256" not in old_guard
     finally:
         await database.close()

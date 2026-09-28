@@ -54,14 +54,15 @@ def test_runtime_profile_skips_the_simulator_only_journal_but_includes_outbox_qu
 def test_simulator_profile_is_the_only_profile_that_owns_simulator_migrations() -> None:
     names = Database.migration_names(MigrationProfile.SIMULATOR)
 
-    assert names[-5:] == (
+    assert names[-6:] == (
         "018_offline_outbox_reconciliation.sql",
         "019_simulator_book_frame_v2.sql",
         "020_simulator_llm_proposals.sql",
         "021_simulator_research_decision_samples.sql",
         "022_simulator_research_observation_schedule.sql",
+        "023_simulator_research_baseline_lineage.sql",
     )
-    assert names[-6] == "017_simulator_journal.sql"
+    assert names[-7] == "017_simulator_journal.sql"
     assert set(Database.migration_names(MigrationProfile.RUNTIME)).issubset(set(names))
 
 
@@ -118,6 +119,24 @@ async def test_simulator_migrator_rejects_a_runtime_history_that_already_skipped
 
     assert "017_simulator_journal.sql" not in connection.applied
     assert not any(sql.startswith("INSERT INTO schema_migrations") for sql in connection.executed)
+
+
+@pytest.mark.asyncio
+async def test_simulator_migrator_advances_an_existing_022_history_without_replaying_it() -> None:
+    names = Database.migration_names(MigrationProfile.SIMULATOR)
+    connection = _MigrationConnection(names[:-1])
+    database = _MigrationDatabase(connection, migration_profile=MigrationProfile.SIMULATOR)
+
+    await database.migrate()
+
+    assert tuple(sorted(connection.applied)) == tuple(sorted(names))
+    assert sum(sql.startswith("INSERT INTO schema_migrations") for sql in connection.executed) == 1
+    assert any(
+        sql.startswith("-- SIM-only forward migration:")
+        and "CREATE OR REPLACE FUNCTION simulator_guard_scheduled_research_sample()" in sql
+        for sql in connection.executed
+    )
+    assert not any("CREATE TABLE sim_research_observation_schedules" in sql for sql in connection.executed)
 
 
 @pytest.mark.asyncio

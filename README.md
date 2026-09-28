@@ -61,6 +61,15 @@ redelivery, rejects changed facts for the same sample, and loads bounded
 integrity-checked pages. The repository does not itself verify the external
 source objects named by receipt hashes. Neither table grants execution authority.
 
+SIM-only migration `022_simulator_research_observation_schedule.sql` freezes the
+three-arm roster before observations. Its published source remains unchanged.
+Forward migration `023_simulator_research_baseline_lineage.sql` first blocks
+sample inserts and scans every scheduled campaign, including sealed ones, for
+baseline-lineage disagreements. It aborts without changing the migration
+history or existing evidence if any are found; otherwise it atomically upgrades
+the insert guard to require the same strategy evaluation and intent in all
+matched arms. Neither migration is part of the runtime/PAPER profile.
+
 ```python
 from kairos_persistence import Database, MigrationProfile
 

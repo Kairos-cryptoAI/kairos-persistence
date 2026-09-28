@@ -37,7 +37,7 @@ dev = [
 required-version = "==0.12.3"
 
 [tool.uv.sources]
-kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "6855430d04315167e5afaa130d6ffc07ada0a7e6" }
+kairos-core = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git", rev = "2b3b0d5b3966eebc8a8f59a8557dd1cc505a933d" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["kairos_persistence"]
