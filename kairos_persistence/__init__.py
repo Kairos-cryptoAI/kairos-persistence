@@ -1,5 +1,6 @@
 """Transactional audit trail and idempotency primitives for Kairos."""
 
+from .adaptive_candidate_protocols import ResearchAdaptiveCandidateProtocolRepository
 from .canary_arm import PaperCanaryArm, PaperCanaryArmRepository
 from .config import PersistenceSettings
 from .database import Database, MigrationProfile
@@ -114,6 +115,7 @@ __all__ = [
     "SimulationTradeJournal",
     "SimulatorProposalRepository",
     "ResearchDecisionSampleRepository",
+    "ResearchAdaptiveCandidateProtocolRepository",
     "ResearchObservationScheduleRepository",
     "SIMULATOR_PROPOSAL_CONSUMER_GROUP",
     "consume_simulator_proposals",

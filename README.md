@@ -68,7 +68,32 @@ sample inserts and scans every scheduled campaign, including sealed ones, for
 baseline-lineage disagreements. It aborts without changing the migration
 history or existing evidence if any are found; otherwise it atomically upgrades
 the insert guard to require the same strategy evaluation and intent in all
-matched arms. Neither migration is part of the runtime/PAPER profile.
+matched arms. Migration `024_simulator_adaptive_candidate_protocol.sql` adds
+the immutable adaptive-candidate roster and binds every new result and coverage
+seal to its preregistered arm digest. All three migrations are excluded from
+the runtime/PAPER profile.
+
+Adaptive-candidate research follows a strict preregistration order:
+
+1. Register and commit the exact `ResearchObservationScheduleV1`.
+2. Register one immutable `AdaptiveCandidateProtocolV1` for that exact schedule
+   with `ResearchAdaptiveCandidateProtocolRepository.register()`.
+3. Before recording each `ResearchDecisionSampleV1`, set its
+   `arm_protocol_digest` to the value returned by
+   `ResearchAdaptiveCandidateProtocolRepository.resolve_arm_digest()` for that
+   campaign and arm.
+4. Seal exhaustive matched-arm coverage with
+   `ResearchObservationScheduleRepository.seal_coverage()`; the seal records
+   the exact `candidate_protocol_digest`.
+
+Exact protocol re-registration is idempotent; any changed roster is rejected.
+The database independently enforces that a protocol was committed before the
+first result, so registering it in the same transaction as a result is invalid.
+Campaigns or results created before migration 024 remain readable with absent
+protocol links, but they cannot receive a retroactive adaptive protocol, more
+scheduled results, or a new coverage seal. They are historical evidence, not
+eligible adaptive campaigns. This simulator-only evidence layer grants no
+execution authority or PAPER, alpha, or LIVE readiness.
 
 ```python
 from kairos_persistence import Database, MigrationProfile

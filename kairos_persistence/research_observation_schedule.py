@@ -8,13 +8,15 @@ this repository so an unscheduled result cannot be silently accepted.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from kairos_core import (
+    RESEARCH_ARMS,
     ResearchCoverageSealV1,
     ResearchObservationScheduleV1,
     canonical_sha256,
 )
+from kairos_core.contracts.research_schedule import ResearchArm
 from kairos_core.research_schedule import evaluate_research_coverage
 from pydantic import ValidationError
 
@@ -121,6 +123,23 @@ class ResearchObservationScheduleRepository:
             schedule = _schedule_from_row(row)
             encoded, payload_sha256 = canonical_payload(schedule.to_payload())
             await self._verify_schedule(connection, row, schedule, encoded, payload_sha256)
+            from .adaptive_candidate_protocols import ResearchAdaptiveCandidateProtocolRepository
+
+            protocol_row = await connection.fetchrow(
+                "SELECT * FROM sim_research_adaptive_candidate_protocols WHERE campaign_id=$1 FOR SHARE",
+                campaign_id,
+            )
+            if protocol_row is None:
+                raise ValueError("campaign has no registered adaptive candidate protocol")
+            protocol = ResearchAdaptiveCandidateProtocolRepository._verify_row(protocol_row)
+            if (
+                protocol_row["freeze_txid"] == await connection.fetchval("SELECT txid_current()")
+                or protocol.campaign_id != schedule.campaign_id
+                or protocol.schedule_digest != schedule.schedule_digest
+            ):
+                raise MessageIdentityConflict(
+                    "coverage requires a previously committed exact adaptive protocol"
+                )
             sample_rows = await connection.fetch(
                 "SELECT * FROM sim_research_decision_samples WHERE campaign_id=$1 "
                 "ORDER BY sample_id, arm_id FOR SHARE",
@@ -134,19 +153,35 @@ class ResearchObservationScheduleRepository:
                     sample_row, sample, sample_encoded, sample_sha256
                 ):
                     raise MessageIdentityConflict("stored research arm result failed integrity verification")
+                if sample.arm_id not in RESEARCH_ARMS:
+                    raise MessageIdentityConflict("stored research result uses an unknown protocol arm")
+                arm_id = cast(ResearchArm, sample.arm_id)
+                if sample.arm_protocol_digest != protocol.arm_digest(arm_id):
+                    raise MessageIdentityConflict(
+                        "stored research arm result differs from its frozen protocol arm"
+                    )
                 if sample_row["recorded_at"] <= row["frozen_at"]:
                     raise MessageIdentityConflict("research arm result predates its frozen schedule")
                 samples.append(sample)
-            seal = evaluate_research_coverage(schedule, samples)
+            evaluated_seal = evaluate_research_coverage(schedule, samples)
+            seal = ResearchCoverageSealV1(
+                campaign_id=evaluated_seal.campaign_id,
+                schedule_digest=evaluated_seal.schedule_digest,
+                candidate_protocol_digest=protocol.protocol_digest,
+                expected_result_count=evaluated_seal.expected_result_count,
+                result_ids_sha256=evaluated_seal.result_ids_sha256,
+            )
             encoded_seal, seal_payload_sha256 = canonical_payload(seal.to_payload())
             await connection.execute(
                 """INSERT INTO sim_research_coverage_seals
-                   (campaign_id, coverage_digest, schedule_digest, expected_result_count,
+                   (campaign_id, coverage_digest, schedule_digest, candidate_protocol_digest,
+                    expected_result_count,
                     result_ids_sha256, authority, payload, payload_sha256)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8)""",
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)""",
                 seal.campaign_id,
                 seal.coverage_digest,
                 seal.schedule_digest,
+                seal.candidate_protocol_digest,
                 seal.expected_result_count,
                 seal.result_ids_sha256,
                 seal.authority,

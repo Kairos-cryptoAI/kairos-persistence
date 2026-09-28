@@ -55,9 +55,10 @@ class ResearchDecisionSampleRepository:
                         llm_completion_started_at_ts_ms, llm_completion_observed_at_ts_ms,
                         llm_failure_receipt_id,
                         llm_failure_class, llm_failure_started_at_ts_ms,
-                        llm_failure_observed_at_ts_ms, authority, payload, payload_sha256)
+                        llm_failure_observed_at_ts_ms, authority, payload, payload_sha256,
+                        arm_protocol_digest)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-                           $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32::jsonb,$33)
+                           $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32::jsonb,$33,$34)
                    ON CONFLICT DO NOTHING RETURNING sample_record_id""",
                 sample.sample_record_id,
                 sample.campaign_id,
@@ -92,6 +93,7 @@ class ResearchDecisionSampleRepository:
                 sample.authority,
                 encoded,
                 payload_sha256,
+                sample.arm_protocol_digest,
             )
             if inserted is not None:
                 return True
@@ -178,6 +180,7 @@ class ResearchDecisionSampleRepository:
             "sample_record_id",
             "campaign_id",
             "arm_id",
+            "arm_protocol_digest",
             "sample_id",
             "symbol",
             "timeframe",
