@@ -29,6 +29,7 @@ from kairos_persistence import (
     PersistenceSettings,
     ResearchAdaptiveCandidateProtocolRepository,
     ResearchDecisionSampleRepository,
+    ResearchEvidenceRepository,
     ResearchObservationScheduleRepository,
     canonical_payload,
 )
@@ -288,10 +289,11 @@ def test_roster_migration_is_sim_only_and_freezes_all_three_arms() -> None:
     assert "022_simulator_research_observation_schedule.sql" not in runtime
     assert "023_simulator_research_baseline_lineage.sql" not in runtime
     assert "024_simulator_adaptive_candidate_protocol.sql" not in runtime
-    assert simulator[-3:] == (
+    assert simulator[-4:] == (
         "022_simulator_research_observation_schedule.sql",
         "023_simulator_research_baseline_lineage.sql",
         "024_simulator_adaptive_candidate_protocol.sql",
+        "025_simulator_research_evidence.sql",
     )
     assert "sim_research_observation_schedules" in sql
     assert "sim_research_observation_windows" in sql
@@ -619,7 +621,7 @@ async def test_023_rejects_preexisting_mismatched_arms_even_for_a_sealed_022_cam
     await connect_verified_database(database, database_name, local_only=True)
     try:
         migrations = Path(__file__).parents[1] / "kairos_persistence" / "migrations"
-        old_profile = Database.migration_names(MigrationProfile.SIMULATOR)[:-2]
+        old_profile = Database.migration_names(MigrationProfile.SIMULATOR)[:-3]
         assert old_profile[-1] == "022_simulator_research_observation_schedule.sql"
         async with database.transaction() as connection:
             await connection.execute("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY)")
@@ -794,6 +796,16 @@ async def test_023_rejects_preexisting_mismatched_arms_even_for_a_sealed_022_cam
         assert legacy_seal_after is not None
         assert all(legacy_seal_after[key] == legacy_seal_before[key] for key in legacy_seal_before.keys())
         assert legacy_seal_after["candidate_protocol_digest"] is None
+        # This explicit in-place upgrade changes the SELECT * row shape. New
+        # application instances reconnect; emulate that before the opt-in API.
+        await database.pool.expire_connections()
+        assert await database.pool.fetchval(
+            "SELECT NOT independent_evidence_registration_allowed "
+            "FROM sim_research_observation_schedules WHERE campaign_id=$1",
+            legacy_schedule.campaign_id,
+        )
+        with pytest.raises(MessageIdentityConflict, match="new eligible"):
+            await ResearchEvidenceRepository(database).enroll_campaign(legacy_schedule.campaign_id)
         assert await database.pool.fetchval(
             "SELECT NOT adaptive_protocol_registration_allowed "
             "FROM sim_research_observation_schedules WHERE campaign_id=$1",

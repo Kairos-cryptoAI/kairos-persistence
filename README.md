@@ -208,6 +208,56 @@ service containers may start concurrently. The database DSN must be provided
 through `KAIROS_PERSISTENCE_DATABASE_URL`; the development default is not a
 production credential.
 
+## Independent SIM research evidence and no-retry attempts
+
+Migration `025_simulator_research_evidence.sql` belongs only to the explicit
+`MigrationProfile.SIMULATOR` manifest. It is not a runtime/PAPER migration and
+does not migrate, read, or repair the production database. Existing Trial 15,
+frozen evaluator/protocol artifacts, and historical geometry-only coverage seals
+are untouched; schedules that existed before 025 cannot be retrospectively
+enrolled into the stronger evidence path.
+
+`ResearchEvidenceRepository` is an opt-in engineering framework, not a profitable
+strategy, evaluator, scientific gate, provider dispatcher, or trading authority.
+Its sequence is deliberately explicit:
+
+1. Commit a new frozen `ResearchObservationScheduleV1` and matching
+   `AdaptiveCandidateProtocolV1`, then separately `enroll_campaign()` before
+   adding any results. Enrollment fixes those exact schedule/protocol identities.
+2. Independently append sanitized `ResearchSourceReceiptV1` JSON content (market,
+   news, macro) and a `ResearchStrategyEvaluationReceiptV1`, including explicit
+   zero-intent evaluations. Canonical hashes are checked on write and load;
+   causal replay resolves actual stored content, not model-claimed references.
+   Evaluation receipts attest which evaluator ran; storage alone does not prove
+   correct strategy execution or future economic performance. JSON payloads are
+   bounded and are never treated as remote paths or resource-fetch instructions.
+3. Derive a stable attempt/reservation ID from the frozen campaign, arm, sample,
+   route, and prompt identity. Commit `ResearchLLMAttemptStartV1` **before** any
+   provider dispatch. Only `start_attempt() == True` admits a new call; `False`
+   is an exact duplicate and must not dispatch. A unique arm/sample fence rejects
+   a different attempt ID, including after restart. `find_attempt()` returns
+   `None` only for actual absence; integrity/database errors fail closed.
+4. Append one `ResearchLLMAttemptTerminalV1`: `COMPLETED` keeps the exact proposal
+   and gateway completion, `FAILED` keeps the actual observed failure, and
+   `UNRESOLVED` honestly keeps ambiguous dispatch/storage outcomes. A START with
+   no terminal is also unresolved: it proves admission, **not** that a provider
+   received the call. No automatic retry, fabricated timeout, suppressed call,
+   or zero-cost assumption is permitted. Actual late timestamps are retained
+   and cannot be backdated into a causal paired result.
+5. `record_verified_sample()` reconstructs the existing core pairing from
+   independent source/evaluation/attempt receipts and compares every result
+   fact. `pending_observations()` exposes the frozen three-arm roster without
+   launching calls or inferring missing outcomes. `seal_verified_coverage()`
+   emits a distinct `INDEPENDENT_SOURCE_REPLAY_ONLY` engineering receipt:
+   economic/PAPER qualification and live order authority are always false.
+
+All receipts and attempt history are append-only in PostgreSQL. A legacy
+geometry seal is not independently source-qualified evidence; neither seal
+reports PnL or substitutes for the unchanged preregistered blind economic gates.
+The optional real-PostgreSQL test requires an explicitly disposable local
+`kairos_sim_test_evidence_*` database through
+`KAIROS_SIM_EVIDENCE_TEST_DATABASE_URL`; it refuses other target names.
+
 ## Cumulative provider qualification budget
 
 Runtime and metered qualification share the immutable

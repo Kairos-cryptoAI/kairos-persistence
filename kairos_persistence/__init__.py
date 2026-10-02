@@ -47,6 +47,14 @@ from .repository import (
     OutboxRecord,
 )
 from .research_decision_samples import ResearchDecisionSampleRepository
+from .research_evidence import (
+    ResearchEvidenceRepository,
+    ResearchLLMAttemptStartV1,
+    ResearchLLMAttemptTerminalV1,
+    ResearchSourceQualifiedCoverageV1,
+    ResearchSourceReceiptV1,
+    ResearchStrategyEvaluationReceiptV1,
+)
 from .research_observation_schedule import ResearchObservationScheduleRepository
 from .runtime import DurableMessageBus, canonical_payload
 from .runtime_health import ExecutionRuntimeHealth, ExecutionRuntimeHealthRepository
@@ -115,6 +123,12 @@ __all__ = [
     "SimulationTradeJournal",
     "SimulatorProposalRepository",
     "ResearchDecisionSampleRepository",
+    "ResearchEvidenceRepository",
+    "ResearchLLMAttemptStartV1",
+    "ResearchLLMAttemptTerminalV1",
+    "ResearchSourceReceiptV1",
+    "ResearchSourceQualifiedCoverageV1",
+    "ResearchStrategyEvaluationReceiptV1",
     "ResearchAdaptiveCandidateProtocolRepository",
     "ResearchObservationScheduleRepository",
     "SIMULATOR_PROPOSAL_CONSUMER_GROUP",

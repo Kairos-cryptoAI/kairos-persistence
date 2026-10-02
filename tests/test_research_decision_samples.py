@@ -69,7 +69,7 @@ def test_research_decision_migration_is_simulator_only_and_append_only() -> None
     ).read_text(encoding="utf-8")
 
     assert "021_simulator_research_decision_samples.sql" not in runtime
-    assert simulator[-4] == "021_simulator_research_decision_samples.sql"
+    assert simulator[-5] == "021_simulator_research_decision_samples.sql"
     assert "UNIQUE (campaign_id, arm_id, sample_id)" in sql
     assert "BEFORE UPDATE OR DELETE" in sql
     assert "BEFORE TRUNCATE" in sql
