@@ -1,0 +1,66 @@
+name: export-runtime-schema-runner
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: export-runtime-schema-runner-2e10e9e936eae3a4
+  cancel-in-progress: false
+
+jobs:
+  export:
+    name: Transport exact published runtime schema runner
+    if: github.repository == 'Kairos-cryptoAI/kairos-persistence' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE_REFERENCE: ghcr.io/kairos-cryptoai/kairos-runtime-schema-profile-runner@sha256:2e10e9e936eae3a4a411f65d8b0bd14670ba808368eeff94b4e24021aa291077
+    steps:
+      - name: Check out reviewed export helper
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install distribution image transport tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes skopeo
+
+      - name: Export only original image bytes with digest preservation
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth_directory="$(mktemp -d "$RUNNER_TEMP/kairos-ghcr-auth.XXXXXX")"
+          auth_file="$auth_directory/auth.json"
+          trap 'rm -f -- "$auth_file"; rmdir -- "$auth_directory"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login --authfile "$auth_file" \
+            --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          unset REGISTRY_TOKEN
+          skopeo copy --authfile "$auth_file" --all --preserve-digests \
+            "docker://$IMAGE_REFERENCE" "dir:$RUNNER_TEMP/kairos-runner-source"
+          python3 scripts/export_runtime_schema_runner.py \
+            --source-directory "$RUNNER_TEMP/kairos-runner-source" \
+            --output-directory "$RUNNER_TEMP/kairos-runner-artifact" \
+            --workflow-repository "$GITHUB_REPOSITORY" \
+            --workflow-run-id "$GITHUB_RUN_ID" --workflow-commit "$GITHUB_SHA"
+          skopeo --version >> "$GITHUB_STEP_SUMMARY"
+          printf '\nExact image transported without rebuilding: `%s`\n' "$IMAGE_REFERENCE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve only the verified image and non-secret receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-schema-runner-exact-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/kairos-runner-artifact/runtime-schema-runner.oci.tar
+            ${{ runner.temp }}/kairos-runner-artifact/transport-receipt.json
+            ${{ runner.temp }}/kairos-runner-artifact/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+          include-hidden-files: false
