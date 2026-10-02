@@ -4,12 +4,14 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from kairos_core.bus import BusEnvelope, MessageBus
 from kairos_core.bus.base import Publishable
 
 from kairos_persistence import DurableMessageBus, InboxClaim, PersistenceSettings, canonical_payload
+from kairos_persistence.database import MigrationProfile
 
 
 class _Transport(MessageBus):
@@ -189,3 +191,80 @@ async def test_handler_without_ack_is_failed_and_transport_remains_pending() -> 
 
     assert events == ["inbox-begin", "inbox-failed"]
     assert transport.acked == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verify,profile", [(True, MigrationProfile.RUNTIME), (False, MigrationProfile.CONTROLLED_RUNTIME)]
+)
+async def test_verified_runtime_start_never_migrates_or_starts_outbox_after_schema_failure(verify, profile):
+    database = type(
+        "Database",
+        (),
+        {
+            "connect": AsyncMock(),
+            "migrate": AsyncMock(),
+            "verify_schema": AsyncMock(side_effect=RuntimeError("schema differs")),
+            "migration_profile": profile,
+        },
+    )()
+    runtime = DurableMessageBus(
+        _Transport([]), service_name="test", database=database, verify_schema_only=verify
+    )
+    with pytest.raises(RuntimeError, match="schema differs"):
+        await runtime.start()
+    database.migrate.assert_not_called()
+    database.verify_schema.assert_awaited_once()
+    assert not runtime._started and runtime._dispatcher is None
+
+
+@pytest.mark.asyncio
+async def test_paper_default_profile_refuses_before_connection_or_outbox():
+    database = type(
+        "Database",
+        (),
+        {
+            "connect": AsyncMock(),
+            "migrate": AsyncMock(),
+            "verify_schema": AsyncMock(),
+            "migration_profile": MigrationProfile.RUNTIME,
+        },
+    )()
+    runtime = DurableMessageBus(
+        _Transport([]),
+        service_name="paper",
+        database=database,
+        verify_schema_only=True,
+        required_migration_profile=MigrationProfile.CONTROLLED_RUNTIME,
+    )
+    with pytest.raises(RuntimeError, match="explicit.*controlled-runtime"):
+        await runtime.start()
+    database.connect.assert_not_called()
+    database.migrate.assert_not_called()
+    database.verify_schema.assert_not_called()
+    assert not runtime._started and runtime._dispatcher is None
+
+
+@pytest.mark.asyncio
+async def test_controlled_profile_rejects_unsafe_runtime_before_outbox(monkeypatch):
+    from kairos_persistence.operator_control import OperatorControlRepository
+
+    probe = AsyncMock(side_effect=PermissionError("roles not independently separated"))
+    monkeypatch.setattr(OperatorControlRepository, "verify_runtime_access", probe)
+    database = type(
+        "Database",
+        (),
+        {
+            "connect": AsyncMock(),
+            "migrate": AsyncMock(),
+            "verify_schema": AsyncMock(),
+            "migration_profile": MigrationProfile.CONTROLLED_RUNTIME,
+            "pool": object(),
+        },
+    )()
+    runtime = DurableMessageBus(_Transport([]), service_name="paper", database=database)
+    with pytest.raises(PermissionError, match="roles not independently separated"):
+        await runtime.start()
+    probe.assert_awaited_once()
+    database.migrate.assert_not_called()
+    assert not runtime._started and runtime._dispatcher is None

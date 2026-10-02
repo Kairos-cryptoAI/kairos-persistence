@@ -29,6 +29,14 @@ from .offline_outbox_reconciler import (
     OfflineOutboxReconciliationState,
 )
 from .offline_writer import OfflineDurableWriter, OfflineWriterError
+from .operator_control import (
+    OperatorAdmissionV1,
+    OperatorCommandV1,
+    OperatorControlRefused,
+    OperatorControlRepository,
+    OperatorControlUnavailable,
+    OperatorSnapshotV1,
+)
 from .repository import (
     AuditRepository,
     InboxClaim,
@@ -105,6 +113,12 @@ __all__ = [
     "AuditRepository",
     "Database",
     "MigrationProfile",
+    "OperatorAdmissionV1",
+    "OperatorCommandV1",
+    "OperatorControlRefused",
+    "OperatorControlRepository",
+    "OperatorControlUnavailable",
+    "OperatorSnapshotV1",
     "DurableMessageBus",
     "DurableLLMUsageBudget",
     "EffectStatus",

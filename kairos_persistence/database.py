@@ -19,6 +19,7 @@ class MigrationProfile(StrEnum):
 
     RUNTIME = "runtime"
     SIMULATOR = "simulator"
+    CONTROLLED_RUNTIME = "controlled-runtime"
 
 
 # Migration 017 owns only the isolated ``kairos-sim`` journal.  It must never
@@ -58,8 +59,9 @@ _SIMULATOR_MIGRATIONS = _RUNTIME_MIGRATIONS[:-1] + (
 _MIGRATION_MANIFESTS: dict[MigrationProfile, tuple[str, ...]] = {
     MigrationProfile.RUNTIME: _RUNTIME_MIGRATIONS,
     MigrationProfile.SIMULATOR: _SIMULATOR_MIGRATIONS,
+    MigrationProfile.CONTROLLED_RUNTIME: _RUNTIME_MIGRATIONS + ("026_operator_control.sql",),
 }
-_KNOWN_MIGRATIONS = frozenset(_SIMULATOR_MIGRATIONS)
+_KNOWN_MIGRATIONS = frozenset(_SIMULATOR_MIGRATIONS) | {"026_operator_control.sql"}
 _DATABASE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,62}\Z")
 _SIMULATOR_DATABASE_NAME = re.compile(r"kairos_sim(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,52})?\Z")
 
@@ -69,15 +71,20 @@ class Database:
         self,
         settings: PersistenceSettings | None = None,
         *,
-        migration_profile: MigrationProfile | str = MigrationProfile.RUNTIME,
+        migration_profile: MigrationProfile | str | None = None,
         read_only: bool = False,
     ) -> None:
         self.settings = settings or PersistenceSettings()
         self.read_only = read_only
         try:
-            self.migration_profile = MigrationProfile(migration_profile)
+            selected_profile = (
+                self.settings.migration_profile if migration_profile is None else migration_profile
+            )
+            self.migration_profile = MigrationProfile(selected_profile)
         except ValueError as exc:
-            raise ValueError("database migration_profile must be runtime or simulator") from exc
+            raise ValueError(
+                "database migration_profile must be runtime, simulator or controlled-runtime"
+            ) from exc
         self.database_name = self.require_profile_database_url(
             self.migration_profile, self.settings.database_url
         )
@@ -111,7 +118,7 @@ class Database:
         is_simulator = _SIMULATOR_DATABASE_NAME.fullmatch(database_name) is not None
         if selected is MigrationProfile.SIMULATOR and not is_simulator:
             raise ValueError("simulator migration_profile requires an explicit kairos_sim database")
-        if selected is MigrationProfile.RUNTIME and is_simulator:
+        if selected is not MigrationProfile.SIMULATOR and is_simulator:
             raise ValueError("runtime migration_profile cannot target an isolated kairos_sim database")
         return database_name
 

@@ -19,7 +19,7 @@ from kairos_core.contracts.base import KairosMessage
 from kairos_core.logging import get_logger
 
 from .config import PersistenceSettings
-from .database import Database
+from .database import Database, MigrationProfile
 from .repository import AuditRepository, InboxTransaction, MessageIdentityConflict
 
 log = get_logger("durable-runtime")
@@ -76,6 +76,8 @@ class DurableMessageBus(MessageBus):
         service_name: str,
         settings: PersistenceSettings | None = None,
         database: Database | None = None,
+        verify_schema_only: bool = False,
+        required_migration_profile: MigrationProfile | None = None,
     ) -> None:
         if not service_name.strip():
             raise ValueError("service_name must not be empty")
@@ -83,6 +85,8 @@ class DurableMessageBus(MessageBus):
         self.service_name = service_name.strip()
         self.settings = settings or PersistenceSettings()
         self.database = database or Database(self.settings)
+        self.verify_schema_only = verify_schema_only
+        self.required_migration_profile = required_migration_profile
         self.repository: AuditRepository | None = None
         self._delivery: ContextVar[_Delivery | None] = ContextVar(f"kairos_delivery_{id(self)}", default=None)
         self._start_lock = asyncio.Lock()
@@ -100,8 +104,26 @@ class DurableMessageBus(MessageBus):
                 return
             if self._closing:
                 raise RuntimeError("durable bus is closing")
+            if (
+                self.required_migration_profile is not None
+                and self.database.migration_profile is not self.required_migration_profile
+            ):
+                raise RuntimeError(
+                    "PAPER requires explicit, independently prepared controlled-runtime schema"
+                )
             await self.database.connect()
-            await self.database.migrate()
+            if (
+                self.verify_schema_only
+                or self.database.migration_profile is MigrationProfile.CONTROLLED_RUNTIME
+            ):
+                await self.database.verify_schema()
+            else:
+                await self.database.migrate()
+            if self.database.migration_profile is MigrationProfile.CONTROLLED_RUNTIME:
+                # Local import avoids the canonical-payload dependency cycle.
+                from .operator_control import OperatorControlRepository
+
+                await OperatorControlRepository(self.database.pool).verify_runtime_access()
             self.repository = AuditRepository(self.database.pool)
             self._started = True
             self._dispatcher = asyncio.create_task(

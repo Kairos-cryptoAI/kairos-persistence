@@ -304,6 +304,39 @@ and never advances the FSM twice. Startup fact audits use
 `list_trades_for_scope(include_terminal=True)` so `FLAT` and `CANCELLED` trades
 cannot hide a missing public lifecycle fact.
 
+## Explicit controlled-runtime operator gate
+
+`CONTROLLED_RUNTIME` is a separate opt-in manifest: the unchanged 17-file
+`RUNTIME` tuple plus `026_operator_control.sql`. `SIM` and the immutable old
+recovery runner are unchanged. Preparing this profile requires a separately
+accepted old-runtime recovery receipt, fresh backup/restore and reviewed clone
+upgrade; installing this code never migrates or arms an existing runtime.
+
+PAPER Risk/Execution startup requires `KAIROS_PERSISTENCE_MIGRATION_PROFILE`
+set explicitly to `controlled-runtime`, verifies the exact schema without
+migrating it, and checks least-privilege separation before starting outbox work.
+Runtime must not be superuser/BYPASSRLS, CREATE ROLE/DB, replication, operator
+member, database/table/trigger-function owner or able to create schema objects
+or change operator evidence. The migration does not create roles or grants.
+An independently provisioned non-superuser LOGIN `kairos_operator` is the only
+latch writer: real PostgreSQL `current_user`, never an arbitrary label.
+
+`OperatorControlRepository` stores an account-wide fixed-lease ARM/DISARM/KILL,
+CAS versions, immutable command audit, risk-decision bindings and committed
+dispatch claims. Local account aliases share the same remote-account key.
+Missing, stale, killed, unavailable or mismatched state denies new entries.
+Account/trade/operator/canary lock order is fixed; no SQL transaction spans the
+bounded external callback. KILL waits for an already guarded in-flight dispatch;
+after KILL commits, subsequent entries are refused. A claim surviving a crash
+is unresolved and must be reconciled without resending, even if no order was
+sent. Protective exits and recovery do not require an armed entry latch.
+
+Offline fakes are not runtime qualification. The optional real PG proof accepts
+only the exact new disposable `kairos_operator_test_20261002` at loopback port
+55433, uses synthetic venue fixtures/fake callbacks, and never touches primary
+or shadow. Passing it does not set PAPER/ALPHA/LIVE readiness or grant trading
+authority.
+
 ## Runtime metrics
 
 `kairos-persistence-exporter` exposes a small Prometheus endpoint without a

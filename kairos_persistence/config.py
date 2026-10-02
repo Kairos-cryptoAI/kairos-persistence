@@ -1,5 +1,7 @@
 """Persistence settings."""
 
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -14,6 +16,7 @@ class PersistenceSettings(BaseSettings):
     pool_min_size: int = Field(default=1, ge=1)
     pool_max_size: int = Field(default=10, ge=1)
     command_timeout_s: float = Field(default=30.0, gt=0)
+    migration_profile: Literal["runtime", "controlled-runtime"] = "runtime"
     inbox_lease_s: float = Field(default=180.0, gt=0)
     outbox_poll_s: float = Field(default=0.25, gt=0)
     outbox_lease_s: float = Field(default=30.0, gt=0)

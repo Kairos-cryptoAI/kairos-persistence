@@ -74,6 +74,30 @@ def test_database_defaults_to_the_fail_closed_runtime_profile() -> None:
     assert database.migration_profile is MigrationProfile.RUNTIME
 
 
+def test_operator_profile_is_additive_and_explicit_not_runtime_or_simulator() -> None:
+    runtime = Database.migration_names(MigrationProfile.RUNTIME)
+    simulator = Database.migration_names(MigrationProfile.SIMULATOR)
+    controlled = Database.migration_names(MigrationProfile.CONTROLLED_RUNTIME)
+    assert len(runtime) == 17 and len(simulator) == 25
+    assert controlled == runtime + ("026_operator_control.sql",)
+    assert "026_operator_control.sql" not in simulator
+    settings = _settings().model_copy(update={"migration_profile": "controlled-runtime"})
+    assert Database(settings).migration_profile is MigrationProfile.CONTROLLED_RUNTIME
+    with pytest.raises(ValueError, match="cannot target"):
+        Database(_settings("kairos_sim_test"), migration_profile=MigrationProfile.CONTROLLED_RUNTIME)
+
+
+@pytest.mark.asyncio
+async def test_controlled_migration_advances_only_the_old_runtime_suffix() -> None:
+    runtime = Database.migration_names(MigrationProfile.RUNTIME)
+    connection = _MigrationConnection(runtime)
+    database = _MigrationDatabase(connection, migration_profile=MigrationProfile.CONTROLLED_RUNTIME)
+    await database.migrate()
+    assert tuple(sorted(connection.applied)) == runtime + ("026_operator_control.sql",)
+    assert sum(sql.startswith("INSERT INTO schema_migrations") for sql in connection.executed) == 1
+    assert not any("CREATE TABLE sim_" in sql for sql in connection.executed)
+
+
 def test_simulator_profile_requires_a_dedicated_physical_database_before_connecting() -> None:
     with pytest.raises(ValueError, match="kairos_sim"):
         Database(_settings("kairos"), migration_profile=MigrationProfile.SIMULATOR)
