@@ -9,7 +9,7 @@ and a second process may account for it but may never dispatch that window again
 from __future__ import annotations
 
 from collections import Counter
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, cast
 
 from kairos_core import (
     RESEARCH_ARMS,
@@ -22,6 +22,15 @@ from kairos_core.contracts.base import StrictValueModel
 from pydantic import Field, StrictInt, StrictStr, model_validator
 
 from .adaptive_candidate_protocols import ResearchAdaptiveCandidateProtocolRepository
+from .causal_campaign import (
+    CampaignEvaluationReceipt,
+    CampaignMarketContextV1,
+    CausalBaselineResultV1,
+    ResearchCausalPairReceiptV1,
+    ResearchCausalStrategyEvaluationReceiptV1,
+    campaign_receipt_contract,
+    decode_campaign_evaluation_row,
+)
 from .database import Database, MigrationProfile
 from .repository import MessageIdentityConflict
 from .research_evidence import (
@@ -42,6 +51,7 @@ _MS = Annotated[StrictInt, Field(ge=0, le=253_402_300_799_999)]
 Arm = Literal["strategy-only", "strategy-review", "llm-proposal-research"]
 _LOCK = 849621
 _CLOCK = "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::BIGINT"
+_CAUSAL_CLOCK = "SELECT ceil(extract(epoch FROM clock_timestamp())*1000)::BIGINT"
 
 
 class ResearchCaptureRequirementV1(StrictValueModel):
@@ -199,7 +209,7 @@ class ResearchDenominatorReceiptV1(_Receipt):
 class ResearchCampaignRepository:
     """A real PostgreSQL recorder and once-only window/attempt journal."""
 
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, *, causal_scheduler_sha256: str | None = None) -> None:
         if (
             not isinstance(database, Database)
             or database.migration_profile is not MigrationProfile.RESEARCH_CAMPAIGN
@@ -207,11 +217,28 @@ class ResearchCampaignRepository:
             raise ValueError("adaptive campaign requires the explicit isolated RESEARCH_CAMPAIGN profile")
         if database.read_only:
             raise ValueError("adaptive campaign recorder requires a writable isolated database")
+        if causal_scheduler_sha256 is not None and (
+            type(causal_scheduler_sha256) is not str
+            or len(causal_scheduler_sha256) != 64
+            or any(x not in "0123456789abcdef" for x in causal_scheduler_sha256)
+        ):
+            raise ValueError("causal scheduler opt-in must be an exact canonical SHA256")
         self._database = database
+        self._causal_scheduler_sha256 = causal_scheduler_sha256
+
+    @property
+    def causal_scheduler_sha256(self) -> str | None:
+        """Explicit family admission, not an inference from a stored plan or caller flag."""
+        return getattr(self, "_causal_scheduler_sha256", None)
 
     async def clock(self) -> int:
         async with self._database.pool.acquire() as connection:
-            return int(await connection.fetchval(_CLOCK))
+            return int(await connection.fetchval(self._clock_sql()))
+
+    def _clock_sql(self) -> str:
+        # Default legacy V1 semantics remain floor. The opt-in causal family
+        # conservatively rounds up, so a fractional post-cutoff tick is late.
+        return _CAUSAL_CLOCK if self.causal_scheduler_sha256 is not None else _CLOCK
 
     async def register(self, plan: ResearchCampaignPlanV1) -> bool:
         _verify_model(plan, ResearchCampaignPlanV1)
@@ -230,7 +257,7 @@ class ResearchCampaignRepository:
                 if _decode_row(old, ResearchCampaignPlanV1) != plan:
                     raise MessageIdentityConflict("campaign already has a different immutable plan")
                 return False
-            if schedule.windows[0].market_as_of_ts_ms <= int(await connection.fetchval(_CLOCK)):
+            if schedule.windows[0].market_as_of_ts_ms <= int(await connection.fetchval(self._clock_sql())):
                 raise MessageIdentityConflict("campaign cannot preregister past decision windows")
             encoded, digest = canonical_payload(plan.model_dump(mode="json"))
             await connection.execute(
@@ -265,6 +292,12 @@ class ResearchCampaignRepository:
             await self._lock(connection, campaign_id)
             plan, schedule, protocol = await self._context(connection, campaign_id)
             self._window(schedule, sample_id)
+            if content.get("contract_version") in (
+                "campaign-market-context.v1",
+                "campaign-news-input.v1",
+                "campaign-macro-input.v1",
+            ):
+                self._require_causal_plan(plan)
             if (source_kind, source_name) not in {
                 (x.source_kind, x.source_name) for x in plan.required_sources
             }:
@@ -293,7 +326,7 @@ class ResearchCampaignRepository:
                 source_name=source_name,
                 reference=reference,
                 source_as_of_ts_ms=source_as_of_ts_ms,
-                observed_at_ts_ms=int(await connection.fetchval(_CLOCK)),
+                observed_at_ts_ms=int(await connection.fetchval(self._clock_sql())),
                 content=content,
             )
             await self._store(connection, receipt, "source", "all", slot)
@@ -304,7 +337,7 @@ class ResearchCampaignRepository:
         async with self._database.transaction() as connection:
             await self._lock(connection, campaign_id)
             plan, _, _ = await self._context(connection, campaign_id)
-            now = int(await connection.fetchval(_CLOCK))
+            now = int(await connection.fetchval(self._clock_sql()))
             row = await connection.fetchrow(
                 """SELECT w.sample_id FROM sim_research_observation_windows w
                 LEFT JOIN sim_adaptive_window_claims c
@@ -386,7 +419,7 @@ class ResearchCampaignRepository:
                 claim_id=claim.claim_id,
                 market_snapshot_sha256=market.content_sha256,
                 source_receipt_sha256s=tuple(sorted(x.receipt_sha256 for x in sources)),
-                frozen_at_ts_ms=int(await connection.fetchval(_CLOCK)),
+                frozen_at_ts_ms=int(await connection.fetchval(self._clock_sql())),
             )
             await self._store(connection, bundle, "bundle", "all", "one")
             return bundle
@@ -420,9 +453,19 @@ class ResearchCampaignRepository:
     async def record_evaluation(
         self, *, claim: ResearchWindowClaimV1, bundle: ResearchCausalBundleV1, intent: StrategyIntentV1 | None
     ) -> ResearchStrategyEvaluationReceiptV1:
+        if self.causal_scheduler_sha256 is not None:
+            raise MessageIdentityConflict("legacy evaluator cannot write through the causal family opt-in")
         async with self._database.transaction() as connection:
             _, schedule, protocol = await self._claimed(connection, claim)
             self._same_bundle(await self._bundle(connection, claim), bundle)
+            for digest in bundle.source_receipt_sha256s:
+                source = await self._load_receipt(connection, digest, ResearchSourceReceiptV1)
+                if source.source_kind == "MARKET_SNAPSHOT" and (
+                    source.content.get("contract_version") == "campaign-market-context.v1"
+                ):
+                    raise MessageIdentityConflict(
+                        "legacy evaluator cannot adopt the new causal context family"
+                    )
             old = await self._row(connection, claim.campaign_id, claim.sample_id, "all", "evaluation", "one")
             if old is not None:
                 saved = _decode_row(old, ResearchStrategyEvaluationReceiptV1)
@@ -453,9 +496,285 @@ class ResearchCampaignRepository:
         async with self._database.pool.acquire() as connection:
             return await self._load_receipt(connection, receipt_sha256, ResearchSourceReceiptV1)
 
-    async def load_evaluation(self, receipt_sha256: str) -> ResearchStrategyEvaluationReceiptV1:
+    async def load_evaluation(self, receipt_sha256: str) -> CampaignEvaluationReceipt:
         async with self._database.pool.acquire() as connection:
-            return await self._load_receipt(connection, receipt_sha256, ResearchStrategyEvaluationReceiptV1)
+            return await self._load_evaluation(connection, receipt_sha256)
+
+    async def load_causal_pair(self, receipt_sha256: str) -> ResearchCausalPairReceiptV1:
+        """Read-only exact typed lookup; an arbitrary Core V1 wrapper is not a causal pair."""
+        async with self._database.pool.acquire() as connection:
+            return await self._load_receipt(connection, receipt_sha256, ResearchCausalPairReceiptV1)
+
+    async def evaluation_recorded_at(
+        self, *, campaign_id: str, sample_id: str, evaluation_receipt_sha256: str
+    ) -> int:
+        """Read the exact saved slot's DB clock; no caller timestamp is substituted."""
+        async with self._database.pool.acquire() as connection:
+            plan, _, _ = await self._context(connection, campaign_id)
+            row = await self._row(connection, campaign_id, sample_id, "all", "evaluation", "one")
+            if row is None:
+                raise MessageIdentityConflict("evaluation lacks its independently saved recording clock")
+            evaluation = decode_campaign_evaluation_row(row)
+            if (evaluation.campaign_id, evaluation.sample_id, evaluation.receipt_sha256) != (
+                campaign_id,
+                sample_id,
+                evaluation_receipt_sha256,
+            ):
+                raise MessageIdentityConflict("evaluation recording clock belongs to a different receipt")
+            if isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1):
+                self._require_causal_plan(plan)
+                return self._causal_recorded_at(row)
+            return self._recorded_at(row)
+
+    async def record_causal_evaluation(
+        self, *, claim: ResearchWindowClaimV1, bundle: ResearchCausalBundleV1, result: CausalBaselineResultV1
+    ) -> ResearchCausalStrategyEvaluationReceiptV1:
+        if type(result) is not CausalBaselineResultV1:
+            raise TypeError("causal evaluation requires the exact versioned baseline result")
+        result = CausalBaselineResultV1.model_validate_json(result.model_dump_json())
+        async with self._database.transaction() as connection:
+            plan, schedule, protocol = await self._claimed(connection, claim)
+            self._require_causal_plan(plan)
+            self._same_bundle(await self._bundle(connection, claim), bundle)
+            context, _, market = await self._causal_context(
+                connection, claim, bundle, plan, schedule, protocol
+            )
+            if (
+                result.context_source_receipt_sha256,
+                result.bar_window_sha256,
+                result.bar_count,
+            ) != (market.receipt_sha256, context.bar_window_sha256, context.bar_count):
+                raise MessageIdentityConflict(
+                    "baseline result differs from independently captured market context"
+                )
+            old = await self._row(connection, claim.campaign_id, claim.sample_id, "all", "evaluation", "one")
+            if old is not None:
+                saved = decode_campaign_evaluation_row(old)
+                if (
+                    not isinstance(saved, ResearchCausalStrategyEvaluationReceiptV1)
+                    or saved.intent != result.intent
+                ):
+                    raise MessageIdentityConflict(
+                        "causal baseline cannot replace a different evaluation family"
+                    )
+                self._same_causal_evaluation(saved, context, market, bundle, schedule, protocol)
+                return saved
+            window = self._window(schedule, claim.sample_id)
+            receipt = ResearchCausalStrategyEvaluationReceiptV1(
+                campaign_id=claim.campaign_id,
+                sample_id=claim.sample_id,
+                schedule_digest=schedule.schedule_digest,
+                candidate_protocol_digest=protocol.protocol_digest,
+                strategy_id=schedule.strategy_id,
+                strategy_revision=schedule.strategy_revision,
+                symbol=window.symbol,
+                evidence_as_of_ts_ms=window.market_as_of_ts_ms,
+                evaluated_at_ts_ms=int(await connection.fetchval(_CAUSAL_CLOCK)),
+                market_snapshot_sha256=bundle.market_snapshot_sha256,
+                evaluator_sha256=schedule.evaluator_sha256,
+                source_receipt_sha256s=bundle.source_receipt_sha256s,
+                context_source_receipt_sha256=str(market.receipt_sha256),
+                anchor_bar_sha256=str(context.anchor_bar.bar_sha256),
+                anchor_bar_close_ts_ms=context.anchor_bar.close_time_ms,
+                bar_window_sha256=context.bar_window_sha256,
+                bar_count=context.bar_count,
+                intent=result.intent,
+            )
+            await self._store(connection, receipt, "evaluation", "all", "one")
+            return receipt
+
+    async def record_causal_pair(
+        self,
+        *,
+        campaign_id: str,
+        sample_id: str,
+        arm_id: str = "llm-proposal-research",
+        evaluation_receipt_sha256: str,
+        attempt_id: str,
+    ) -> ResearchCausalPairReceiptV1:
+        """Resolve a new-family advisory pair under the existing single campaign lock.
+
+        No caller supplies an action, pairing clock, source-qualified flag or
+        strategy provenance. Exact replay remains possible after the deadline.
+        """
+        if arm_id != "llm-proposal-research":
+            raise MessageIdentityConflict("causal pair is restricted to the proposal research arm")
+        async with self._database.transaction() as connection:
+            await self._lock(connection, campaign_id)
+            plan, schedule, protocol = await self._context(connection, campaign_id)
+            self._require_causal_plan(plan)
+            claim = await self._load_claim(connection, campaign_id, sample_id)
+            bundle = await self._bundle(connection, claim)
+            context, sources, market = await self._causal_context(
+                connection, claim, bundle, plan, schedule, protocol
+            )
+            evaluation = await self._load_evaluation(connection, evaluation_receipt_sha256)
+            if not isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1):
+                raise MessageIdentityConflict("causal pair cannot adopt a legacy exact-clock evaluation")
+            self._same_causal_evaluation(evaluation, context, market, bundle, schedule, protocol)
+            evaluation_row = await self._row(connection, campaign_id, sample_id, "all", "evaluation", "one")
+            if evaluation_row is None or decode_campaign_evaluation_row(evaluation_row) != evaluation:
+                raise MessageIdentityConflict(
+                    "causal pair evaluation is not the independently saved sample slot"
+                )
+            starts = await connection.fetch(
+                "SELECT * FROM sim_adaptive_campaign_receipts "
+                "WHERE campaign_id=$1 AND sample_id=$2 AND arm_id=$3 AND kind='start'",
+                campaign_id,
+                sample_id,
+                arm_id,
+            )
+            if len(starts) != 1:
+                raise MessageIdentityConflict("causal pair requires exactly one independently admitted START")
+            start = _decode_row(starts[0], ResearchLLMAttemptStartV1)
+            terminal_row = await self._row(connection, campaign_id, sample_id, arm_id, "terminal", attempt_id)
+            if terminal_row is None:
+                raise MessageIdentityConflict("unresolved START cannot become a causal pair")
+            terminal = _decode_row(terminal_row, ResearchLLMAttemptTerminalV1)
+            window = self._window(schedule, sample_id)
+            arm = next(x for x in protocol.arms if x.arm_id == arm_id)
+            if (
+                start.attempt_id != attempt_id
+                or start.campaign_id != campaign_id
+                or start.sample_id != sample_id
+                or start.arm_id != arm_id
+                or terminal.attempt_id != attempt_id
+                or terminal.start_receipt_sha256 != start.receipt_sha256
+                or terminal.terminal_status != "COMPLETED"
+                or terminal.proposal is None
+                or terminal.completion is None
+            ):
+                raise MessageIdentityConflict("causal pair lacks an exact completed proposal START history")
+            proposal, completion = terminal.proposal, terminal.completion
+            provenance = proposal.model_provenance
+            for field in ("symbol", "timeframe", "market_as_of_ts_ms", "sample_deadline_ts_ms"):
+                if getattr(start, field) != getattr(window, field):
+                    raise MessageIdentityConflict("causal pair START differs from preregistered sample")
+            if (
+                start.schedule_digest,
+                start.candidate_protocol_digest,
+                start.arm_protocol_digest,
+                start.provider,
+                start.requested_model,
+                start.prompt_sha256,
+                start.market_snapshot_sha256,
+            ) != (
+                schedule.schedule_digest,
+                protocol.protocol_digest,
+                protocol.arm_digest(arm_id),
+                arm.provider,
+                arm.model,
+                arm.prompt_sha256,
+                bundle.market_snapshot_sha256,
+            ):
+                raise MessageIdentityConflict("causal pair START differs from frozen model or causal bundle")
+            for field in (
+                "campaign_id",
+                "sample_id",
+                "arm_id",
+                "symbol",
+                "timeframe",
+                "market_as_of_ts_ms",
+                "market_snapshot_sha256",
+                "sample_deadline_ts_ms",
+                "attempt_started_at_ts_ms",
+            ):
+                if getattr(completion, field) != getattr(start, field):
+                    raise MessageIdentityConflict("causal pair completion differs from admitted START")
+            if (
+                provenance.provider,
+                provenance.requested_model,
+                provenance.resolved_model,
+                provenance.prompt_sha256,
+                provenance.budget_reservation_id,
+            ) != (
+                start.provider,
+                start.requested_model,
+                start.requested_model,
+                start.prompt_sha256,
+                start.budget_reservation_id,
+            ):
+                raise MessageIdentityConflict("causal pair backend differs from the frozen model")
+            from kairos_core import EvidenceReferenceV1
+
+            allowed = {
+                canonical_sha256(
+                    EvidenceReferenceV1(
+                        kind=x.source_kind,
+                        reference=x.reference,
+                        content_sha256=x.content_sha256,
+                        observed_at_ms=x.observed_at_ts_ms,
+                    )
+                )
+                for x in sources
+            }
+            if any(canonical_sha256(x) not in allowed for x in proposal.evidence):
+                raise MessageIdentityConflict("causal pair proposal cites unsaved or post-cutoff evidence")
+            old = await self._row(connection, campaign_id, sample_id, arm_id, "sample", "one")
+            saved = _decode_row(old, ResearchCausalPairReceiptV1) if old is not None else None
+            paired_at = (
+                saved.paired_at_ts_ms if saved is not None else int(await connection.fetchval(_CAUSAL_CLOCK))
+            )
+            if old is not None and not paired_at <= self._causal_recorded_at(old) <= window.paired_at_ts_ms:
+                raise MessageIdentityConflict("saved causal pair lacks timely actual database recording")
+            if not (
+                window.market_as_of_ts_ms
+                <= start.attempt_started_at_ts_ms
+                <= completion.response_observed_at_ts_ms
+                <= paired_at
+                <= window.paired_at_ts_ms
+                < window.sample_deadline_ts_ms
+                and self._causal_recorded_at(terminal_row) <= paired_at
+                and evaluation.evaluated_at_ts_ms <= paired_at
+                and self._causal_recorded_at(evaluation_row) <= paired_at
+                and (
+                    proposal.action.value not in ("LONG_BIAS", "SHORT_BIAS", "VOLATILITY_ALERT")
+                    or proposal.expires_at_ts_ms > paired_at
+                )
+                and (evaluation.intent is None or evaluation.intent.entry_expires_ts_ms > paired_at)
+            ):
+                raise MessageIdentityConflict("late, stale or future evidence cannot become a causal pair")
+            receipt = ResearchCausalPairReceiptV1(
+                campaign_id=campaign_id,
+                sample_id=sample_id,
+                schedule_digest=schedule.schedule_digest,
+                candidate_protocol_digest=protocol.protocol_digest,
+                arm_protocol_digest=protocol.arm_digest(arm_id),
+                bundle_receipt_sha256=str(bundle.receipt_sha256),
+                evaluation_receipt_sha256=str(evaluation.receipt_sha256),
+                source_receipt_sha256s=bundle.source_receipt_sha256s,
+                market_snapshot_sha256=bundle.market_snapshot_sha256,
+                anchor_bar_sha256=evaluation.anchor_bar_sha256,
+                bar_window_sha256=evaluation.bar_window_sha256,
+                bar_count=evaluation.bar_count,
+                market_as_of_ts_ms=window.market_as_of_ts_ms,
+                paired_at_ts_ms=paired_at,
+                attempt_id=attempt_id,
+                start_receipt_sha256=str(start.receipt_sha256),
+                terminal_receipt_sha256=str(terminal.receipt_sha256),
+                completion_receipt_id=str(completion.completion_receipt_id),
+                proposal_id=str(proposal.proposal_id),
+                strategy_outcome=cast(
+                    Literal["LONG", "SHORT", "NO_INTENT"],
+                    evaluation.intent.side.value if evaluation.intent else "NO_INTENT",
+                ),
+                strategy_intent_id=evaluation.intent.intent_id if evaluation.intent else None,
+                llm_outcome=proposal.action.value,
+            )
+            if saved is not None:
+                if saved != receipt:
+                    raise MessageIdentityConflict(
+                        "causal pair cannot rewrite independently stored comparison facts"
+                    )
+                return saved
+            await self._store(connection, receipt, "sample", arm_id, "one")
+            recorded = await self._row(connection, campaign_id, sample_id, arm_id, "sample", "one")
+            if (
+                recorded is None
+                or not paired_at <= self._causal_recorded_at(recorded) <= window.paired_at_ts_ms
+            ):
+                raise MessageIdentityConflict("actual database pairing crossed its preregistered cutoff")
+            return receipt
 
     async def find_attempt(self, attempt_id: str):
         async with self._database.pool.acquire() as connection:
@@ -476,11 +795,12 @@ class ResearchCampaignRepository:
         async with self._database.transaction() as connection:
             await self._lock(connection, attempt.campaign_id)
             plan, schedule, protocol = await self._context(connection, attempt.campaign_id)
+            await self._guard_causal_evaluation(connection, plan, attempt.campaign_id, attempt.sample_id)
             claim = await self._load_claim(connection, attempt.campaign_id, attempt.sample_id)
             bundle = await self._bundle(connection, claim)
             window = self._window(schedule, attempt.sample_id)
             arm = next(x for x in protocol.arms if x.arm_id == attempt.arm_id)
-            now = int(await connection.fetchval(_CLOCK))
+            now = int(await connection.fetchval(self._clock_sql()))
             if not window.market_as_of_ts_ms <= now < window.paired_at_ts_ms:
                 raise MessageIdentityConflict("new attempt is outside its actual DB admission window")
             if abs(now - attempt.attempt_started_at_ts_ms) > plan.maximum_clock_skew_ms:
@@ -547,6 +867,8 @@ class ResearchCampaignRepository:
                         raise MessageIdentityConflict("terminal provenance differs from durable START")
         async with self._database.transaction() as connection:
             await self._lock(connection, start.campaign_id)
+            plan, _, _ = await self._context(connection, start.campaign_id)
+            await self._guard_causal_evaluation(connection, plan, start.campaign_id, start.sample_id)
             review = await self._row(
                 connection, start.campaign_id, start.sample_id, start.arm_id, "review", start.attempt_id
             )
@@ -619,6 +941,10 @@ class ResearchCampaignRepository:
             raise MessageIdentityConflict("review cannot replace an unresolved/failed terminal")
         async with self._database.transaction() as connection:
             await self._lock(connection, receipt.campaign_id)
+            plan, _, _ = await self._context(connection, receipt.campaign_id)
+            causal_evaluation = await self._guard_causal_evaluation(
+                connection, plan, receipt.campaign_id, receipt.sample_id
+            )
             if (
                 await self._row(
                     connection,
@@ -646,9 +972,20 @@ class ResearchCampaignRepository:
             await self._response_clock(connection, start, receipt.observed_at_ts_ms)
             claim = await self._load_claim(connection, receipt.campaign_id, receipt.sample_id)
             bundle = await self._bundle(connection, claim)
-            evaluation = await self._load_receipt(
-                connection, receipt.evaluation_receipt_sha256, ResearchStrategyEvaluationReceiptV1
+            evaluation = (
+                await self._load_evaluation(connection, receipt.evaluation_receipt_sha256)
+                if causal_evaluation is not None
+                else await self._load_receipt(
+                    connection, receipt.evaluation_receipt_sha256, ResearchStrategyEvaluationReceiptV1
+                )
             )
+            if isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1):
+                plan, schedule, protocol = await self._context(connection, receipt.campaign_id)
+                self._require_causal_plan(plan)
+                context, _, market = await self._causal_context(
+                    connection, claim, bundle, plan, schedule, protocol
+                )
+                self._same_causal_evaluation(evaluation, context, market, bundle, schedule, protocol)
             if (
                 evaluation.intent is None
                 or evaluation.source_receipt_sha256s != bundle.source_receipt_sha256s
@@ -709,6 +1046,8 @@ class ResearchCampaignRepository:
     ) -> int:
         """Actual PostgreSQL insertion clock, not a caller completion timestamp."""
         async with self._database.pool.acquire() as connection:
+            if self.causal_scheduler_sha256 is not None:
+                await self._context(connection, campaign_id)
             rows = [
                 row
                 for kind in ("review", "terminal")
@@ -719,14 +1058,18 @@ class ResearchCampaignRepository:
                 raise MessageIdentityConflict("arm has conflicting independent completion histories")
             if not rows:
                 raise MessageIdentityConflict("completion has no independently stored recording clock")
-            return self._recorded_at(rows[0])
+            return (
+                self._causal_recorded_at(rows[0])
+                if self.causal_scheduler_sha256 is not None
+                else self._recorded_at(rows[0])
+            )
 
     async def record_cost(self, receipt: ResearchCostReceiptV1) -> bool:
         _verify_model(receipt, ResearchCostReceiptV1)
         async with self._database.transaction() as connection:
             await self._lock(connection, receipt.campaign_id)
             await self._load_claim(connection, receipt.campaign_id, receipt.sample_id)
-            now = int(await connection.fetchval(_CLOCK))
+            now = int(await connection.fetchval(self._clock_sql()))
             if receipt.observed_at_ts_ms != now:
                 # Receipt creation and insertion occur in separate bounded calls;
                 # permit honest elapsed recording, never future/backdated input.
@@ -796,6 +1139,9 @@ class ResearchCampaignRepository:
     async def record_verified_sample(self, sample: ResearchDecisionSampleV1) -> bool:
         """Rebuild from this new journal, never insert into the immutable legacy SIM25 path."""
         from kairos_core.research_pairing import ScheduledResearchSampleV1, build_research_decision_sample
+
+        if self.causal_scheduler_sha256 is not None:
+            raise MessageIdentityConflict("Core V1 samples cannot write through the causal family opt-in")
 
         async with self._database.transaction() as connection:
             await self._lock(connection, sample.campaign_id)
@@ -868,7 +1214,8 @@ class ResearchCampaignRepository:
             claim = await self._load_claim(connection, outcome.campaign_id, outcome.sample_id)
             if claim.claim_id != outcome.claim_id:
                 raise MessageIdentityConflict("outcome has no exact independently committed window claim")
-            _, schedule, _ = await self._context(connection, outcome.campaign_id)
+            plan, schedule, protocol = await self._context(connection, outcome.campaign_id)
+            await self._guard_causal_evaluation(connection, plan, outcome.campaign_id, outcome.sample_id)
             window = self._window(schedule, outcome.sample_id)
             old = await self._row(
                 connection, outcome.campaign_id, outcome.sample_id, outcome.arm_id, "outcome", "one"
@@ -877,7 +1224,7 @@ class ResearchCampaignRepository:
                 if _decode_row(old, ResearchArmOutcomeV1) != outcome:
                     raise MessageIdentityConflict("scheduled outcome cannot be rewritten after observation")
                 return False
-            now = int(await connection.fetchval(_CLOCK))
+            now = int(await connection.fetchval(self._clock_sql()))
             if not claim.claimed_at_ts_ms <= outcome.observed_at_ts_ms <= now:
                 raise MessageIdentityConflict("scheduled outcome has no honest actual recorder time")
             bundle_row = await self._row(
@@ -887,9 +1234,15 @@ class ResearchCampaignRepository:
                 connection, outcome.campaign_id, outcome.sample_id, "all", "evaluation", "one"
             )
             bundle = _decode_row(bundle_row, ResearchCausalBundleV1) if bundle_row else None
-            evaluation = (
-                _decode_row(evaluation_row, ResearchStrategyEvaluationReceiptV1) if evaluation_row else None
-            )
+            evaluation = decode_campaign_evaluation_row(evaluation_row) if evaluation_row else None
+            if isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1):
+                self._require_causal_plan(plan)
+                if bundle is None:
+                    raise MessageIdentityConflict("causal evaluation lacks its independently frozen bundle")
+                context, _, market = await self._causal_context(
+                    connection, claim, bundle, plan, schedule, protocol
+                )
+                self._same_causal_evaluation(evaluation, context, market, bundle, schedule, protocol)
             if (outcome.bundle_receipt_sha256, outcome.evaluation_receipt_sha256) != (
                 bundle.receipt_sha256 if bundle else None,
                 evaluation.receipt_sha256 if evaluation else None,
@@ -946,7 +1299,12 @@ class ResearchCampaignRepository:
                 ):
                     if (
                         decision.observed_at_ts_ms > window.paired_at_ts_ms
-                        or self._recorded_at(review_row or terminal_row) > window.paired_at_ts_ms
+                        or (
+                            self._causal_recorded_at(review_row or terminal_row)
+                            if isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1)
+                            else self._recorded_at(review_row or terminal_row)
+                        )
+                        > window.paired_at_ts_ms
                     ):
                         expected_status = "LATE"
                     elif review is not None:
@@ -961,7 +1319,13 @@ class ResearchCampaignRepository:
                     raise MessageIdentityConflict(
                         "arm outcome is not derived from its independent attempt history"
                     )
-            elif evaluation is not None and evaluation.evaluated_at_ts_ms > window.paired_at_ts_ms:
+            elif evaluation is not None and (
+                evaluation.evaluated_at_ts_ms > window.paired_at_ts_ms
+                or (
+                    isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1)
+                    and self._causal_recorded_at(evaluation_row) > window.paired_at_ts_ms
+                )
+            ):
                 if outcome.status != "LATE":
                     raise MessageIdentityConflict("late evaluator cannot become a timely outcome")
             elif outcome.arm_id == "strategy-only" and evaluation is not None:
@@ -1002,6 +1366,25 @@ class ResearchCampaignRepository:
                     )
             if outcome.decision_receipt_sha256 != (decision.receipt_sha256 if decision else None):
                 raise MessageIdentityConflict("outcome must retain its actual independent completion link")
+            if isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1) and (
+                outcome.causal_sample_receipt_sha256 is not None
+            ):
+                pair = await self._load_receipt(
+                    connection, outcome.causal_sample_receipt_sha256, ResearchCausalPairReceiptV1
+                )
+                if (
+                    pair.campaign_id != outcome.campaign_id
+                    or pair.sample_id != outcome.sample_id
+                    or pair.arm_id != outcome.arm_id
+                    or pair.evaluation_receipt_sha256 != evaluation.receipt_sha256
+                    or pair.bundle_receipt_sha256 != outcome.bundle_receipt_sha256
+                    or pair.attempt_id != outcome.attempt_id
+                    or pair.terminal_receipt_sha256 != outcome.decision_receipt_sha256
+                    or outcome.status != "PROPOSAL"
+                ):
+                    raise MessageIdentityConflict(
+                        "causal outcome pair differs from independently stored arm history"
+                    )
             for digest in (
                 outcome.bundle_receipt_sha256,
                 outcome.evaluation_receipt_sha256,
@@ -1070,7 +1453,13 @@ class ResearchCampaignRepository:
                     "campaign window exceeds its bounded independent receipt roster"
                 )
             return {
-                (row["kind"], row["arm_id"], row["slot_key"]): _decode_row(row, models[row["kind"]])
+                (row["kind"], row["arm_id"], row["slot_key"]): (
+                    decode_campaign_evaluation_row(row)
+                    if row["kind"] == "evaluation"
+                    else decode_campaign_sample_row(row)
+                    if row["kind"] == "sample"
+                    else _decode_row(row, models[row["kind"]])
+                )
                 for row in rows
             }
 
@@ -1195,12 +1584,150 @@ class ResearchCampaignRepository:
             protocol.protocol_digest,
         ):
             raise MessageIdentityConflict("stored campaign plan differs from frozen source identity")
+        if self.causal_scheduler_sha256 is not None:
+            self._require_causal_plan(plan)
         return plan, schedule, protocol
+
+    def _require_causal_plan(self, plan: ResearchCampaignPlanV1) -> None:
+        if self.causal_scheduler_sha256 is None or plan.scheduler_sha256 != self.causal_scheduler_sha256:
+            raise MessageIdentityConflict(
+                "causal receipt family requires its explicitly frozen scheduler identity"
+            )
+
+    async def _guard_causal_evaluation(self, connection, plan, campaign_id, sample_id):
+        row = await self._row(connection, campaign_id, sample_id, "all", "evaluation", "one")
+        evaluation = decode_campaign_evaluation_row(row) if row is not None else None
+        if isinstance(evaluation, ResearchCausalStrategyEvaluationReceiptV1):
+            self._require_causal_plan(plan)
+            return evaluation
+        return None
+
+    async def _causal_context(self, connection, claim, bundle, plan, schedule, protocol):
+        """Resolve stored descriptors only, never a caller-selected source or window."""
+        window = self._window(schedule, claim.sample_id)
+        if (bundle.campaign_id, bundle.sample_id, bundle.claim_id) != (
+            claim.campaign_id,
+            claim.sample_id,
+            claim.claim_id,
+        ):
+            raise MessageIdentityConflict("causal bundle differs from the independently committed claim")
+        sources = tuple(
+            [
+                await self._load_receipt(connection, digest, ResearchSourceReceiptV1)
+                for digest in bundle.source_receipt_sha256s
+            ]
+        )
+        requirements = {(x.source_kind, x.source_name): x.maximum_age_ms for x in plan.required_sources}
+        if {(x.source_kind, x.source_name) for x in sources} != requirements.keys() or len(sources) != len(
+            requirements
+        ):
+            raise MessageIdentityConflict("causal source roster differs from preregistered capture policy")
+        for source in sources:
+            if (
+                source.campaign_id != claim.campaign_id
+                or source.sample_id != claim.sample_id
+                or source.schedule_digest != schedule.schedule_digest
+                or source.candidate_protocol_digest != protocol.protocol_digest
+                or not source.source_as_of_ts_ms <= source.observed_at_ts_ms <= window.market_as_of_ts_ms
+                or window.market_as_of_ts_ms - source.source_as_of_ts_ms
+                > requirements[(source.source_kind, source.source_name)]
+            ):
+                raise MessageIdentityConflict(
+                    "causal source identity, availability or freshness failed replay"
+                )
+            if source.source_kind != "MARKET_SNAPSHOT":
+                # Delayed import keeps the producer bridge's repository dependency
+                # acyclic. Only this new family requires its exact producer bytes.
+                from .campaign_inputs import decode_campaign_macro, decode_campaign_news
+
+                try:
+                    message = (
+                        decode_campaign_news(source.content)
+                        if source.source_kind == "NEWS"
+                        else decode_campaign_macro(source.content)
+                    )
+                except (TypeError, ValueError):
+                    raise MessageIdentityConflict(
+                        "causal source failed its exact producer contract"
+                    ) from None
+                if (
+                    message.message_id != source.reference
+                    or int(message.produced_at.timestamp() * 1000) != source.source_as_of_ts_ms
+                ):
+                    raise MessageIdentityConflict(
+                        "causal source rewrote its original producer identity or clock"
+                    )
+        market = next(x for x in sources if x.source_kind == "MARKET_SNAPSHOT")
+        context = CampaignMarketContextV1.model_validate(market.content)
+        produced = int(context.market_snapshot.produced_at.timestamp() * 1000)
+        if (
+            context.anchor_bar.symbol != window.symbol
+            or context.anchor_bar.timeframe != window.timeframe
+            or market.content_sha256 != bundle.market_snapshot_sha256
+            or not context.anchor_bar.close_time_ms < window.market_as_of_ts_ms
+            or not context.anchor_bar.close_time_ms
+            <= produced
+            == market.source_as_of_ts_ms
+            < window.market_as_of_ts_ms
+            or market.reference != context.market_snapshot.message_id
+            or (
+                window.market_snapshot_sha256 is not None
+                and window.market_snapshot_sha256 != market.content_sha256
+            )
+            or bundle.frozen_at_ts_ms < window.market_as_of_ts_ms
+        ):
+            raise MessageIdentityConflict(
+                "causal context differs from actual bar, original envelope or cutoff"
+            )
+        return context, sources, market
+
+    @staticmethod
+    def _same_causal_evaluation(evaluation, context, market, bundle, schedule, protocol):
+        if (
+            evaluation.campaign_id,
+            evaluation.sample_id,
+            evaluation.schedule_digest,
+            evaluation.candidate_protocol_digest,
+            evaluation.strategy_id,
+            evaluation.strategy_revision,
+            evaluation.symbol,
+            evaluation.timeframe,
+            evaluation.market_snapshot_sha256,
+            evaluation.evaluator_sha256,
+            evaluation.source_receipt_sha256s,
+            evaluation.context_source_receipt_sha256,
+            evaluation.anchor_bar_sha256,
+            evaluation.anchor_bar_close_ts_ms,
+            evaluation.bar_window_sha256,
+            evaluation.bar_count,
+        ) != (
+            bundle.campaign_id,
+            bundle.sample_id,
+            schedule.schedule_digest,
+            protocol.protocol_digest,
+            schedule.strategy_id,
+            schedule.strategy_revision,
+            context.anchor_bar.symbol,
+            "1m",
+            bundle.market_snapshot_sha256,
+            schedule.evaluator_sha256,
+            bundle.source_receipt_sha256s,
+            market.receipt_sha256,
+            context.anchor_bar.bar_sha256,
+            context.anchor_bar.close_time_ms,
+            context.bar_window_sha256,
+            context.bar_count,
+        ) or evaluation.evidence_as_of_ts_ms != ResearchCampaignRepository._window(
+            schedule, bundle.sample_id
+        ).market_as_of_ts_ms:
+            raise MessageIdentityConflict(
+                "causal evaluation differs from independently saved source fingerprints"
+            )
 
     async def _response_clock(self, connection, start: ResearchLLMAttemptStartV1, observed_at: int) -> None:
         plan, schedule, _ = await self._context(connection, start.campaign_id)
         window = self._window(schedule, start.sample_id)
-        now = int(await connection.fetchval(_CLOCK))
+        now = int(await connection.fetchval(self._clock_sql()))
         if (
             now < window.market_as_of_ts_ms
             or observed_at < start.attempt_started_at_ts_ms
@@ -1213,6 +1740,13 @@ class ResearchCampaignRepository:
         value = row["recorded_at_ts_ms"]
         if type(value) is not int or not 0 <= value <= 253_402_300_799_999:
             raise MessageIdentityConflict("completion lacks a bounded actual database recording clock")
+        return value
+
+    @staticmethod
+    def _causal_recorded_at(row: Any) -> int:
+        value = row["causal_recorded_at_ts_ms"]
+        if type(value) is not int or not 0 <= value <= 253_402_300_799_999:
+            raise MessageIdentityConflict("causal completion lacks a conservative actual DB recording clock")
         return value
 
     async def _claimed(self, connection: Any, claim: ResearchWindowClaimV1):
@@ -1237,7 +1771,8 @@ class ResearchCampaignRepository:
     @staticmethod
     async def _row(connection: Any, campaign_id: str, sample_id: str, arm: str, kind: str, slot: str):
         return await connection.fetchrow(
-            "SELECT *,floor(extract(epoch FROM recorded_at)*1000)::BIGINT AS recorded_at_ts_ms "
+            "SELECT *,floor(extract(epoch FROM recorded_at)*1000)::BIGINT AS recorded_at_ts_ms,"
+            "ceil(extract(epoch FROM recorded_at)*1000)::BIGINT AS causal_recorded_at_ts_ms "
             "FROM sim_adaptive_campaign_receipts "
             "WHERE campaign_id=$1 AND sample_id=$2 AND arm_id=$3 AND kind=$4 AND slot_key=$5",
             campaign_id,
@@ -1278,7 +1813,18 @@ class ResearchCampaignRepository:
         )
         if row is None:
             raise MessageIdentityConflict("independently stored campaign receipt is missing")
+        if model is ResearchCausalPairReceiptV1 and row["kind"] != "sample":
+            raise MessageIdentityConflict("causal pair must occupy its independent sample receipt kind")
         return _decode_row(row, model)
+
+    @staticmethod
+    async def _load_evaluation(connection: Any, digest: str) -> CampaignEvaluationReceipt:
+        row = await connection.fetchrow(
+            "SELECT * FROM sim_adaptive_campaign_receipts WHERE receipt_sha256=$1", digest
+        )
+        if row is None:
+            raise MessageIdentityConflict("independently stored campaign evaluation is missing")
+        return decode_campaign_evaluation_row(row)
 
     @classmethod
     async def _store(
@@ -1318,3 +1864,15 @@ class _CampaignSampleV1(_Receipt):
     campaign_id: _ID
     sample_id: _ID
     sample: ResearchDecisionSampleV1
+
+
+def decode_campaign_sample_row(row: Any) -> _CampaignSampleV1 | ResearchCausalPairReceiptV1:
+    """Read-only closed dispatch; the new pair has its own hash, not a Core sample ID."""
+    if row["kind"] != "sample":
+        raise MessageIdentityConflict("campaign sample contract is stored in a different receipt kind")
+    contract = campaign_receipt_contract(row)
+    if contract == "adaptive-causal-sample-link.v1":
+        return _decode_row(row, _CampaignSampleV1)
+    if contract == "research-causal-pair.v1":
+        return _decode_row(row, ResearchCausalPairReceiptV1)
+    raise MessageIdentityConflict("unknown campaign sample contract")
