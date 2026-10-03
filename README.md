@@ -360,3 +360,45 @@ Separate expected, attempted, succeeded and failed gauges make the result audita
 The PAPER account age includes only reconciled `PAPER`/`DEV` snapshots and is `-1`
 when no such snapshot exists. Inbox monitoring likewise exports the oldest current
 processing-attempt age and the number of rows whose recovery lease has expired.
+
+## Opt-in causal research campaign journal
+
+`ResearchCampaignRepository` in `kairos_persistence.research_campaign` requires
+an explicit writable `MigrationProfile.RESEARCH_CAMPAIGN` and an isolated
+`kairos_sim...` database. Its manifest is exactly SIM25 plus additive migration
+027; RUNTIME17, CONTROLLED_RUNTIME and legacy SIM25 migration bytes/semantics
+are unchanged. No default runtime setting selects this profile. Installing the
+package does not migrate a primary, shadow or PAPER database.
+
+A future frozen schedule and three-arm candidate protocol must be committed
+before the campaign plan is enrolled. Enrollment cannot adopt old windows,
+legacy evidence or existing results. The plan freezes source kinds/names/age
+bounds, evaluator and scheduler identities, deadlines and bounded tick size.
+Market, news and macro content is captured independently with the actual DB
+clock. Decision cutoff must be after the captured market close; source-as-of
+and actual capture must both be at/before cutoff. Missing, stale and late input
+is never backdated or repaired into a successful causal sample. The new
+campaign-specific resolver does not relax old SIM25 exact-clock equality.
+
+Window claims and per-arm START fences are append-only, without leases or
+automatic reclaim/retry. A crashed claim is eventually accounted as missed;
+a surviving START is unknown unless independently completed. Review
+`ALLOW/VETO/DEFER` has its own receipt, distinct from proposal completions.
+Reservation-request, known denial, reserve, commit-request and commit facts
+are separate immutable observations. Unknown budget operations retain their
+conservative held bounds; an absent completion never implies zero cost.
+
+The denominator requires all scheduled windows and all three arms, including
+no-intent, missing, late, failed and unknown outcomes. It is a point-in-time
+`SCHEDULED_DENOMINATOR_ONLY` snapshot, not an economic seal: late actual
+terminal/cost facts remain append-only and do not rewrite that snapshot.
+`economic_qualification=false` and `live_orders_allowed=false` always.
+There is no order/risk conversion, production scheduler or paid provider
+factory in this slice. Real causal content, a frozen actual evaluator, shared
+durable budget and a separately accepted research configuration must still be
+supplied explicitly; fixture receipts are labeled engineering-only.
+
+Native acceptance is opt-in through
+`KAIROS_RESEARCH_CAMPAIGN_TEST_DATABASE_URL`, restricted to loopback and exact
+`kairos_sim_test_campaign_<UUID4 hex>` disposable names. Offline SQL-shaped
+tests do not qualify PostgreSQL triggers, production recovery or alpha.

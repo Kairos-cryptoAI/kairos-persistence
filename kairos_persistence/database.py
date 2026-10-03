@@ -20,6 +20,7 @@ class MigrationProfile(StrEnum):
     RUNTIME = "runtime"
     SIMULATOR = "simulator"
     CONTROLLED_RUNTIME = "controlled-runtime"
+    RESEARCH_CAMPAIGN = "research-campaign"
 
 
 # Migration 017 owns only the isolated ``kairos-sim`` journal.  It must never
@@ -60,8 +61,12 @@ _MIGRATION_MANIFESTS: dict[MigrationProfile, tuple[str, ...]] = {
     MigrationProfile.RUNTIME: _RUNTIME_MIGRATIONS,
     MigrationProfile.SIMULATOR: _SIMULATOR_MIGRATIONS,
     MigrationProfile.CONTROLLED_RUNTIME: _RUNTIME_MIGRATIONS + ("026_operator_control.sql",),
+    MigrationProfile.RESEARCH_CAMPAIGN: _SIMULATOR_MIGRATIONS + ("027_simulator_adaptive_campaign.sql",),
 }
-_KNOWN_MIGRATIONS = frozenset(_SIMULATOR_MIGRATIONS) | {"026_operator_control.sql"}
+_KNOWN_MIGRATIONS = frozenset(_SIMULATOR_MIGRATIONS) | {
+    "026_operator_control.sql",
+    "027_simulator_adaptive_campaign.sql",
+}
 _DATABASE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,62}\Z")
 _SIMULATOR_DATABASE_NAME = re.compile(r"kairos_sim(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,52})?\Z")
 
@@ -116,9 +121,9 @@ class Database:
         if not isinstance(database_name, str) or not _DATABASE_NAME.fullmatch(database_name):
             raise ValueError("database migration target must be a simple explicit database name")
         is_simulator = _SIMULATOR_DATABASE_NAME.fullmatch(database_name) is not None
-        if selected is MigrationProfile.SIMULATOR and not is_simulator:
+        if selected in (MigrationProfile.SIMULATOR, MigrationProfile.RESEARCH_CAMPAIGN) and not is_simulator:
             raise ValueError("simulator migration_profile requires an explicit kairos_sim database")
-        if selected is not MigrationProfile.SIMULATOR and is_simulator:
+        if selected not in (MigrationProfile.SIMULATOR, MigrationProfile.RESEARCH_CAMPAIGN) and is_simulator:
             raise ValueError("runtime migration_profile cannot target an isolated kairos_sim database")
         return database_name
 

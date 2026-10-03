@@ -34,7 +34,7 @@ class ResearchObservationScheduleRepository:
     def __init__(self, database: Database) -> None:
         if not isinstance(database, Database):
             raise TypeError("research schedule requires an explicit Database")
-        if database.migration_profile is not MigrationProfile.SIMULATOR:
+        if database.migration_profile not in (MigrationProfile.SIMULATOR, MigrationProfile.RESEARCH_CAMPAIGN):
             raise ValueError("research schedule requires the isolated SIMULATOR profile")
         if database.read_only:
             raise ValueError("research schedule requires a writable simulator database")

@@ -26,7 +26,7 @@ class ResearchAdaptiveCandidateProtocolRepository:
     def __init__(self, database: Database) -> None:
         if not isinstance(database, Database):
             raise TypeError("adaptive candidate protocol storage requires an explicit Database")
-        if database.migration_profile is not MigrationProfile.SIMULATOR:
+        if database.migration_profile not in (MigrationProfile.SIMULATOR, MigrationProfile.RESEARCH_CAMPAIGN):
             raise ValueError("adaptive candidate protocol storage requires the isolated SIMULATOR profile")
         if database.read_only:
             raise ValueError("adaptive candidate protocol storage cannot use a read-only database")
