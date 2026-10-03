@@ -547,6 +547,19 @@ class ResearchCampaignRepository:
                         raise MessageIdentityConflict("terminal provenance differs from durable START")
         async with self._database.transaction() as connection:
             await self._lock(connection, start.campaign_id)
+            review = await self._row(
+                connection, start.campaign_id, start.sample_id, start.arm_id, "review", start.attempt_id
+            )
+            if review is not None:
+                raise MessageIdentityConflict("terminal cannot overwrite an independently completed review")
+            existing = await self._row(
+                connection, start.campaign_id, start.sample_id, start.arm_id, "terminal", start.attempt_id
+            )
+            if existing is not None:
+                if _decode_row(existing, ResearchLLMAttemptTerminalV1) != terminal:
+                    raise MessageIdentityConflict("terminal cannot rewrite an immutable completion")
+                return False
+            await self._response_clock(connection, start, terminal.observed_at_ts_ms)
             provenance = terminal.proposal.model_provenance if terminal.proposal else terminal.failure
             if provenance is not None and (
                 provenance.provider != start.provider
@@ -555,6 +568,11 @@ class ResearchCampaignRepository:
                 or provenance.budget_reservation_id != start.budget_reservation_id
             ):
                 raise MessageIdentityConflict("terminal route differs from independently admitted START")
+            if (
+                terminal.proposal is not None
+                and terminal.proposal.model_provenance.resolved_model != start.requested_model
+            ):
+                raise MessageIdentityConflict("terminal backend differs from the frozen requested model")
             if terminal.proposal is not None:
                 from kairos_core import EvidenceReferenceV1
 
@@ -581,11 +599,6 @@ class ResearchCampaignRepository:
                     )
             if start.arm_id != "llm-proposal-research" and terminal.terminal_status == "COMPLETED":
                 raise MessageIdentityConflict("review completion cannot be recorded as a proposal")
-            review = await self._row(
-                connection, start.campaign_id, start.sample_id, start.arm_id, "review", start.attempt_id
-            )
-            if review is not None:
-                raise MessageIdentityConflict("terminal cannot overwrite an independently completed review")
             return await self._store(
                 connection,
                 terminal,
@@ -618,6 +631,19 @@ class ResearchCampaignRepository:
                 is not None
             ):
                 raise MessageIdentityConflict("review cannot race a previously committed terminal")
+            existing = await self._row(
+                connection,
+                receipt.campaign_id,
+                receipt.sample_id,
+                "strategy-review",
+                "review",
+                receipt.attempt_id,
+            )
+            if existing is not None:
+                if _decode_row(existing, ResearchReviewReceiptV1) != receipt:
+                    raise MessageIdentityConflict("review cannot rewrite an immutable completion")
+                return False
+            await self._response_clock(connection, start, receipt.observed_at_ts_ms)
             claim = await self._load_claim(connection, receipt.campaign_id, receipt.sample_id)
             bundle = await self._bundle(connection, claim)
             evaluation = await self._load_receipt(
@@ -634,8 +660,14 @@ class ResearchCampaignRepository:
                 raise MessageIdentityConflict(
                     "review requires the matched independently saved strategy intent"
                 )
-            if (receipt.bundle_receipt_sha256, receipt.requested_model, receipt.prompt_sha256) != (
+            if (
+                receipt.bundle_receipt_sha256,
+                receipt.requested_model,
+                receipt.resolved_model,
+                receipt.prompt_sha256,
+            ) != (
                 bundle.receipt_sha256,
+                start.requested_model,
                 start.requested_model,
                 start.prompt_sha256,
             ):
@@ -671,6 +703,23 @@ class ResearchCampaignRepository:
                 "SELECT * FROM sim_adaptive_campaign_receipts WHERE kind='review' AND slot_key=$1", attempt_id
             )
             return _decode_row(row, ResearchReviewReceiptV1) if row else None
+
+    async def decision_recorded_at(
+        self, *, campaign_id: str, sample_id: str, arm_id: Arm, attempt_id: str
+    ) -> int:
+        """Actual PostgreSQL insertion clock, not a caller completion timestamp."""
+        async with self._database.pool.acquire() as connection:
+            rows = [
+                row
+                for kind in ("review", "terminal")
+                if (row := await self._row(connection, campaign_id, sample_id, arm_id, kind, attempt_id))
+                is not None
+            ]
+            if len(rows) > 1:
+                raise MessageIdentityConflict("arm has conflicting independent completion histories")
+            if not rows:
+                raise MessageIdentityConflict("completion has no independently stored recording clock")
+            return self._recorded_at(rows[0])
 
     async def record_cost(self, receipt: ResearchCostReceiptV1) -> bool:
         _verify_model(receipt, ResearchCostReceiptV1)
@@ -775,6 +824,8 @@ class ResearchCampaignRepository:
                 )
                 if row is None:
                     raise MessageIdentityConflict("unfinished START cannot become a causal sample")
+                if self._recorded_at(row) > window.paired_at_ts_ms:
+                    raise MessageIdentityConflict("late-recorded completion cannot become a causal sample")
                 terminal = _decode_row(row, ResearchLLMAttemptTerminalV1)
                 if terminal.terminal_status == "UNRESOLVED":
                     raise MessageIdentityConflict("ambiguous START cannot become a causal sample")
@@ -893,7 +944,10 @@ class ResearchCampaignRepository:
                 if decision is not None and not (
                     terminal is not None and terminal.terminal_status == "UNRESOLVED"
                 ):
-                    if decision.observed_at_ts_ms > window.paired_at_ts_ms:
+                    if (
+                        decision.observed_at_ts_ms > window.paired_at_ts_ms
+                        or self._recorded_at(review_row or terminal_row) > window.paired_at_ts_ms
+                    ):
                         expected_status = "LATE"
                     elif review is not None:
                         expected_status = review.output.action
@@ -1028,8 +1082,6 @@ class ResearchCampaignRepository:
             row = await connection.fetchrow(
                 "SELECT * FROM sim_adaptive_campaign_denominators WHERE campaign_id=$1", campaign_id
             )
-            if row is not None:
-                return _decode_row(row, ResearchDenominatorReceiptV1)
             rows = await connection.fetch(
                 "SELECT * FROM sim_adaptive_campaign_receipts "
                 "WHERE campaign_id=$1 AND kind='outcome' ORDER BY sample_id,arm_id",
@@ -1041,6 +1093,29 @@ class ResearchCampaignRepository:
                 raise MessageIdentityConflict(
                     "denominator requires every preregistered window and all three arms"
                 )
+            if row is not None:
+                saved = _decode_row(row, ResearchDenominatorReceiptV1)
+                if (
+                    saved.plan_receipt_sha256,
+                    saved.recording_mode,
+                    saved.expected_outcomes,
+                    saved.outcome_ids_sha256,
+                    saved.status_counts,
+                    saved.unknown_attempt_count,
+                ) != (
+                    plan.receipt_sha256,
+                    plan.recording_mode,
+                    len(expected),
+                    canonical_sha256({"outcome_receipt_sha256s": sorted(x.receipt_sha256 for x in outcomes)}),
+                    dict(Counter(x.status for x in outcomes)),
+                    sum(x.status == "UNKNOWN" for x in outcomes),
+                ):
+                    raise MessageIdentityConflict(
+                        "stored denominator differs from immutable scheduled outcomes"
+                    )
+                # Costs are deliberately a point-in-time snapshot: late actual
+                # cost/completion facts do not rewrite the existing seal.
+                return saved
             costs = tuple(
                 _decode_row(x, ResearchCostReceiptV1)
                 for x in await connection.fetch(
@@ -1122,6 +1197,24 @@ class ResearchCampaignRepository:
             raise MessageIdentityConflict("stored campaign plan differs from frozen source identity")
         return plan, schedule, protocol
 
+    async def _response_clock(self, connection, start: ResearchLLMAttemptStartV1, observed_at: int) -> None:
+        plan, schedule, _ = await self._context(connection, start.campaign_id)
+        window = self._window(schedule, start.sample_id)
+        now = int(await connection.fetchval(_CLOCK))
+        if (
+            now < window.market_as_of_ts_ms
+            or observed_at < start.attempt_started_at_ts_ms
+            or abs(now - observed_at) > plan.maximum_clock_skew_ms
+        ):
+            raise MessageIdentityConflict("completion clock differs from actual campaign recorder time")
+
+    @staticmethod
+    def _recorded_at(row: Any) -> int:
+        value = row["recorded_at_ts_ms"]
+        if type(value) is not int or not 0 <= value <= 253_402_300_799_999:
+            raise MessageIdentityConflict("completion lacks a bounded actual database recording clock")
+        return value
+
     async def _claimed(self, connection: Any, claim: ResearchWindowClaimV1):
         _verify_model(claim, ResearchWindowClaimV1)
         await self._lock(connection, claim.campaign_id)
@@ -1144,7 +1237,8 @@ class ResearchCampaignRepository:
     @staticmethod
     async def _row(connection: Any, campaign_id: str, sample_id: str, arm: str, kind: str, slot: str):
         return await connection.fetchrow(
-            "SELECT * FROM sim_adaptive_campaign_receipts "
+            "SELECT *,floor(extract(epoch FROM recorded_at)*1000)::BIGINT AS recorded_at_ts_ms "
+            "FROM sim_adaptive_campaign_receipts "
             "WHERE campaign_id=$1 AND sample_id=$2 AND arm_id=$3 AND kind=$4 AND slot_key=$5",
             campaign_id,
             sample_id,
