@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from kairos_core.bus.base import Publishable
 
 from kairos_persistence import DurableMessageBus, InboxClaim, PersistenceSettings, canonical_payload
 from kairos_persistence.database import MigrationProfile
+from kairos_persistence.repository import OutboxRecord
 
 
 class _Transport(MessageBus):
@@ -111,6 +113,87 @@ class _Repository:
         return True
 
 
+class _DispatchRepository:
+    def __init__(
+        self,
+        record: OutboxRecord,
+        *,
+        ack: bool | None = True,
+        ack_error: Exception | None = None,
+        claim_error: Exception | None = None,
+    ) -> None:
+        self.record = record
+        self.ack = ack
+        self.ack_error = ack_error
+        self.claim_error = claim_error
+        self.calls: list[tuple[str, Any]] = []
+        self.runtime: DurableMessageBus | None = None
+
+    async def claim_outbox(self, *args: Any, **kwargs: Any) -> list[OutboxRecord]:
+        self.calls.append(("claim-committed", kwargs))
+        if self.claim_error is not None:
+            raise self.claim_error
+        assert self.runtime is not None
+        self.runtime._closing = True
+        return [self.record]
+
+    async def mark_published(self, record: OutboxRecord, worker_id: str) -> bool:
+        self.calls.append(("ack", (record, worker_id)))
+        if self.ack_error is not None:
+            raise self.ack_error
+        return bool(self.ack)
+
+    async def mark_outbox_publish_outcome_unknown(
+        self, record: OutboxRecord, worker_id: str, *, reason_code: str
+    ) -> bool:
+        self.calls.append(("unknown", (record, worker_id, reason_code)))
+        return True
+
+    async def fail_outbox(self, *args: Any, **kwargs: Any) -> bool:
+        self.calls.append(("unsafe-retry", args))
+        return True
+
+
+def _outbox_record(*, payload: dict[str, Any] | None = None, sha256: str | None = None) -> OutboxRecord:
+    selected_payload = _payload("outgoing-dispatch-1") if payload is None else payload
+    digest = canonical_payload(selected_payload)[1] if sha256 is None else sha256
+    return OutboxRecord(
+        id=71,
+        producer="test-service",
+        message_id="outgoing-dispatch-1",
+        topic="output",
+        payload=selected_payload,
+        payload_sha256=digest,
+        publish_attempts=4,
+        reconciliation_id="dispatch:stable-test-id",
+    )
+
+
+def _dispatch_runtime(transport: _Transport, repository: _DispatchRepository) -> DurableMessageBus:
+    runtime = DurableMessageBus(
+        transport,
+        service_name="test-service",
+        settings=PersistenceSettings(shutdown_timeout_s=0),
+        database=_Database([]),  # type: ignore[arg-type]
+    )
+    runtime.repository = repository  # type: ignore[assignment]
+    repository.runtime = runtime
+    return runtime
+
+
+class _DispatchTransport(_Transport):
+    def __init__(self, *, publish_error: BaseException | None = None) -> None:
+        super().__init__([])
+        self.publish_error = publish_error
+        self.events: list[str] = []
+
+    async def publish(self, topic: str, message: Publishable) -> str:
+        self.events.append("publish")
+        if self.publish_error is not None:
+            raise self.publish_error
+        return await super().publish(topic, message)
+
+
 def _payload(message_id: str) -> dict[str, Any]:
     return {
         "schema_version": "1.0",
@@ -139,6 +222,138 @@ def test_canonical_payload_is_order_independent_and_content_sensitive() -> None:
     assert encoded_a == encoded_b == '{"a":1,"b":2}'
     assert digest_a == digest_b
     assert canonical_payload({"a": 2})[1] != digest_a
+
+
+@pytest.mark.asyncio
+async def test_dispatch_claim_is_committed_before_publish_and_ack_uses_claim_record() -> None:
+    transport = _DispatchTransport()
+    repository = _DispatchRepository(_outbox_record())
+    runtime = _dispatch_runtime(transport, repository)
+
+    await runtime._dispatch_outbox()
+
+    assert repository.calls[0][0] == "claim-committed"
+    assert transport.events == ["publish"]
+    assert [call[0] for call in repository.calls] == ["claim-committed", "ack"]
+    record, worker_id = repository.calls[1][1]
+    assert record.reconciliation_id == "dispatch:stable-test-id"
+    assert worker_id == runtime._worker_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("publish_error", "ack", "ack_error", "expected_reason"),
+    [
+        (RuntimeError("secret-like token=must-not-persist"), True, None, "PUBLISH_EXCEPTION"),
+        (None, False, None, "ACK_NOT_APPLIED"),
+        (None, True, RuntimeError("database details must-not-persist"), "ACK_EXCEPTION"),
+    ],
+)
+async def test_dispatch_ambiguous_publish_or_ack_never_retries(
+    publish_error: BaseException | None,
+    ack: bool | None,
+    ack_error: Exception | None,
+    expected_reason: str,
+) -> None:
+    transport = _DispatchTransport(publish_error=publish_error)
+    repository = _DispatchRepository(_outbox_record(), ack=ack, ack_error=ack_error)
+    runtime = _dispatch_runtime(transport, repository)
+
+    await runtime._dispatch_outbox()
+
+    expected_calls = (
+        ["claim-committed", "unknown"]
+        if expected_reason == "PUBLISH_EXCEPTION"
+        else ["claim-committed", "ack", "unknown"]
+    )
+    assert [call[0] for call in repository.calls] == expected_calls
+    assert repository.calls[-1][1][2] == expected_reason
+    assert "unsafe-retry" not in [call[0] for call in repository.calls]
+    if expected_reason == "PUBLISH_EXCEPTION":
+        assert transport.published == []
+    else:
+        assert len(transport.published) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("publish_error", "expected_reason"),
+    [
+        (asyncio.CancelledError(), "PUBLISH_CANCELLED"),
+        (None, "ACK_CANCELLED"),
+    ],
+)
+async def test_dispatch_cancellation_after_claim_quarantines_and_propagates(
+    publish_error: BaseException | None,
+    expected_reason: str,
+) -> None:
+    transport = _DispatchTransport(publish_error=publish_error)
+    repository = _DispatchRepository(
+        _outbox_record(), ack_error=asyncio.CancelledError() if publish_error is None else None
+    )
+    runtime = _dispatch_runtime(transport, repository)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime._dispatch_outbox()
+
+    expected_calls = (
+        ["claim-committed", "unknown"]
+        if expected_reason == "PUBLISH_CANCELLED"
+        else ["claim-committed", "ack", "unknown"]
+    )
+    assert [call[0] for call in repository.calls] == expected_calls
+    assert repository.calls[-1][1][2] == expected_reason
+    assert "unsafe-retry" not in [call[0] for call in repository.calls]
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_during_transport_wait_persists_unknown_marker() -> None:
+    entered_publish = asyncio.Event()
+
+    class _BlockingTransport(_DispatchTransport):
+        async def publish(self, topic: str, message: Publishable) -> str:
+            self.events.append("publish")
+            entered_publish.set()
+            await asyncio.Event().wait()
+            return "unreachable"
+
+    transport = _BlockingTransport()
+    repository = _DispatchRepository(_outbox_record())
+    runtime = _dispatch_runtime(transport, repository)
+    task = asyncio.create_task(runtime._dispatch_outbox())
+    await entered_publish.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [call[0] for call in repository.calls] == ["claim-committed", "unknown"]
+    assert repository.calls[-1][1][2] == "PUBLISH_CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_claim_failure_never_reaches_publisher() -> None:
+    transport = _DispatchTransport()
+    repository = _DispatchRepository(_outbox_record(), claim_error=RuntimeError("claim rollback"))
+    runtime = _dispatch_runtime(transport, repository)
+
+    with pytest.raises(RuntimeError, match="claim rollback"):
+        await runtime._dispatch_outbox()
+
+    assert transport.events == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_hash_mismatch_is_quarantined_before_publisher_call() -> None:
+    transport = _DispatchTransport()
+    repository = _DispatchRepository(_outbox_record(sha256="0" * 64))
+    runtime = _dispatch_runtime(transport, repository)
+
+    await runtime._dispatch_outbox()
+
+    assert transport.events == []
+    assert [call[0] for call in repository.calls] == ["claim-committed", "unknown"]
+    assert repository.calls[-1][1][2] == "PRE_PUBLISH_HASH_MISMATCH"
 
 
 @pytest.mark.asyncio

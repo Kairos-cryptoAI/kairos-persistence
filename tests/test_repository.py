@@ -11,7 +11,7 @@ import pytest
 from kairos_core.contracts import SentimentSignal
 from kairos_core.enums import ImpactDirection
 
-from kairos_persistence.repository import AuditRepository
+from kairos_persistence.repository import AuditRepository, OutboxRecord
 
 
 def _sql_kind(sql: str) -> str:
@@ -145,7 +145,7 @@ class _ClaimConnection:
 
     async def fetch(self, sql: str, *params: Any) -> list[dict[str, Any]]:
         self.sql = " ".join(sql.split())
-        return self.rows
+        return sorted(self.rows, key=lambda row: row["id"])[:1]
 
     def snapshot(self) -> dict[str, Any]:
         return {}
@@ -282,6 +282,7 @@ async def test_claim_outbox_preserves_causal_id_order() -> None:
             "payload": {"message_id": "later"},
             "payload_sha256": "b" * 64,
             "publish_attempts": 1,
+            "reconciliation_id": "dispatch:later",
         },
         {
             "id": 11,
@@ -291,6 +292,7 @@ async def test_claim_outbox_preserves_causal_id_order() -> None:
             "payload": {"message_id": "earlier"},
             "payload_sha256": "a" * 64,
             "publish_attempts": 1,
+            "reconciliation_id": "dispatch:earlier",
         },
     ]
     connection = _ClaimConnection(rows)
@@ -298,10 +300,54 @@ async def test_claim_outbox_preserves_causal_id_order() -> None:
 
     claimed = await repo.claim_outbox("worker", producer="quant", limit=2)
 
-    assert [record.id for record in claimed] == [11, 12]
+    assert [record.id for record in claimed] == [11]
     assert "SELECT * FROM claimed ORDER BY id" in connection.sql
     assert "prior.producer=outbox.producer" in connection.sql
     assert "LIMIT LEAST($2, 1)" in connection.sql
+    assert "outbox.reconciliation_state='NONE'" in connection.sql
+    assert "outbox.publish_attempts=0" in connection.sql
+    assert "outbox.lease_owner IS NULL" in connection.sql
+    assert "outbox.lease_until IS NULL" in connection.sql
+    assert "reconciliation_state='PUBLISHING'" in connection.sql
+    assert "reconciliation_id=$5" in connection.sql
+    assert all(record.reconciliation_id for record in claimed)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ack_and_unknown_are_bound_to_claim_identity_and_attempt_count() -> None:
+    pool = AsyncMock()
+    pool.execute.return_value = "UPDATE 1"
+    repo = AuditRepository(pool)
+    record = OutboxRecord(
+        id=17,
+        producer="quant",
+        message_id="logical-17",
+        topic="bars",
+        payload={"message_id": "logical-17"},
+        payload_sha256="a" * 64,
+        publish_attempts=5,
+        reconciliation_id="dispatch:claim-17",
+    )
+
+    assert await repo.mark_published(record, "worker-17")
+    ack_sql, *ack_args = pool.execute.call_args.args
+    assert "reconciliation_state='ACKNOWLEDGED'" in ack_sql
+    assert "reconciliation_state='PUBLISHING'" in ack_sql
+    assert "publish_attempts=publish_attempts+1" not in ack_sql
+    assert ack_args == [17, "quant", "logical-17", "bars", "a" * 64, 5, "worker-17", "dispatch:claim-17"]
+
+    assert await repo.mark_outbox_publish_outcome_unknown(
+        record, "worker-17", reason_code="PUBLISH_EXCEPTION"
+    )
+    unknown_sql, *unknown_args = pool.execute.call_args.args
+    assert "reconciliation_state='PUBLISH_OUTCOME_UNKNOWN'" in unknown_sql
+    assert "reconciliation_state='PUBLISHING'" in unknown_sql
+    assert unknown_args[:-1] == ack_args
+    assert unknown_args[-1] == "automatic_dispatch:PUBLISH_EXCEPTION"
+    with pytest.raises(ValueError, match="failure category"):
+        await repo.mark_outbox_publish_outcome_unknown(
+            record, "worker-17", reason_code="token=must-never-persist"
+        )
 
 
 @pytest.mark.asyncio

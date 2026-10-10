@@ -20,7 +20,7 @@ from kairos_core.logging import get_logger
 
 from .config import PersistenceSettings
 from .database import Database, MigrationProfile
-from .repository import AuditRepository, InboxTransaction, MessageIdentityConflict
+from .repository import AuditRepository, InboxTransaction, MessageIdentityConflict, OutboxRecord
 
 log = get_logger("durable-runtime")
 
@@ -269,34 +269,91 @@ class DurableMessageBus(MessageBus):
             for record in records:
                 try:
                     _encoded, actual_sha256 = canonical_payload(record.payload)
-                    if record.payload_sha256 is not None and actual_sha256 != record.payload_sha256:
-                        raise MessageIdentityConflict(
-                            f"outbox row {record.id} payload does not match its fingerprint"
-                        )
-                    await self.transport.publish(record.topic, record.payload)
-                    if not await repository.mark_published(record.id, self._worker_id):
-                        raise RuntimeError(f"outbox lease lost for row {record.id}")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    retry_s = min(
-                        self.settings.outbox_retry_max_s,
-                        self.settings.outbox_retry_base_s * (2 ** min(record.publish_attempts - 1, 16)),
-                    )
-                    await repository.fail_outbox(
-                        record.id,
-                        self._worker_id,
-                        str(exc),
-                        retry_after=timedelta(seconds=retry_s),
-                        max_attempts=self.settings.outbox_max_attempts,
-                    )
-                    log.exception(
-                        "durable.outbox_publish_failed",
+                except Exception:
+                    await self._mark_outbox_unknown(repository, record, "PRE_PUBLISH_HASH_MISMATCH")
+                    log.error(
+                        "durable.outbox_fail_closed",
                         service=self.service_name,
                         row_id=record.id,
-                        message_id=record.message_id,
-                        attempt=record.publish_attempts,
+                        reason_code="PRE_PUBLISH_HASH_MISMATCH",
                     )
+                    continue
+                if record.payload_sha256 is None or actual_sha256 != record.payload_sha256:
+                    await self._mark_outbox_unknown(repository, record, "PRE_PUBLISH_HASH_MISMATCH")
+                    log.error(
+                        "durable.outbox_fail_closed",
+                        service=self.service_name,
+                        row_id=record.id,
+                        reason_code="PRE_PUBLISH_HASH_MISMATCH",
+                    )
+                    continue
+                try:
+                    await self.transport.publish(record.topic, record.payload)
+                except asyncio.CancelledError:
+                    await self._mark_outbox_unknown(repository, record, "PUBLISH_CANCELLED")
+                    raise
+                except Exception as exc:
+                    await self._mark_outbox_unknown(repository, record, "PUBLISH_EXCEPTION")
+                    log.error(
+                        "durable.outbox_fail_closed",
+                        service=self.service_name,
+                        row_id=record.id,
+                        attempt=record.publish_attempts,
+                        reason_code="PUBLISH_EXCEPTION",
+                        exception_type=type(exc).__name__,
+                    )
+                    continue
+
+                try:
+                    acknowledged = await repository.mark_published(record, self._worker_id)
+                except asyncio.CancelledError:
+                    await self._mark_outbox_unknown(repository, record, "ACK_CANCELLED")
+                    raise
+                except Exception as exc:
+                    await self._mark_outbox_unknown(repository, record, "ACK_EXCEPTION")
+                    log.error(
+                        "durable.outbox_fail_closed",
+                        service=self.service_name,
+                        row_id=record.id,
+                        attempt=record.publish_attempts,
+                        reason_code="ACK_EXCEPTION",
+                        exception_type=type(exc).__name__,
+                    )
+                    continue
+                if not acknowledged:
+                    await self._mark_outbox_unknown(repository, record, "ACK_NOT_APPLIED")
+                    log.error(
+                        "durable.outbox_fail_closed",
+                        service=self.service_name,
+                        row_id=record.id,
+                        attempt=record.publish_attempts,
+                        reason_code="ACK_NOT_APPLIED",
+                    )
+
+    async def _mark_outbox_unknown(
+        self, repository: AuditRepository, record: OutboxRecord, reason_code: str
+    ) -> bool:
+        """Best-effort terminal quarantine; PUBLISHING itself blocks every retry."""
+        try:
+            return await asyncio.shield(
+                repository.mark_outbox_publish_outcome_unknown(
+                    record,
+                    self._worker_id,
+                    reason_code=reason_code,
+                )
+            )
+        except asyncio.CancelledError:
+            # If this best-effort transition is interrupted, the committed
+            # PUBLISHING state remains excluded from normal dispatch forever.
+            raise
+        except Exception:
+            log.error(
+                "durable.outbox_unknown_marker_failed",
+                service=self.service_name,
+                row_id=record.id,
+                reason_code=reason_code,
+            )
+            return False
 
     async def close(self) -> None:
         if self._closing:

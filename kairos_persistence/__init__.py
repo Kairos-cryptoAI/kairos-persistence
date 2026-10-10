@@ -37,6 +37,10 @@ from .operator_control import (
     OperatorControlUnavailable,
     OperatorSnapshotV1,
 )
+from .redis_acceptance_evidence import (
+    RedisAcceptanceEvidenceError,
+    RedisAcceptanceEvidenceV1,
+)
 from .repository import (
     AuditRepository,
     InboxClaim,
@@ -52,6 +56,10 @@ from .repository import (
     OfflineOutboxQuarantineRejection,
     OfflineOutboxQuarantineResult,
     OfflineOutboxQuarantineState,
+    OfflineOutboxTransportResolutionReceipt,
+    OfflineOutboxTransportResolutionRejection,
+    OfflineOutboxTransportResolutionResult,
+    OfflineOutboxTransportResolutionState,
     OutboxRecord,
 )
 from .research_decision_samples import ResearchDecisionSampleRepository
@@ -165,6 +173,12 @@ __all__ = [
     "OfflineOutboxQuarantineReceipt",
     "OfflineOutboxQuarantineResult",
     "OfflineOutboxQuarantineState",
+    "OfflineOutboxTransportResolutionReceipt",
+    "OfflineOutboxTransportResolutionRejection",
+    "OfflineOutboxTransportResolutionResult",
+    "OfflineOutboxTransportResolutionState",
+    "RedisAcceptanceEvidenceError",
+    "RedisAcceptanceEvidenceV1",
     "OfflineOutboxReconciler",
     "OfflineOutboxReconciliationResult",
     "OfflineOutboxReconciliationState",

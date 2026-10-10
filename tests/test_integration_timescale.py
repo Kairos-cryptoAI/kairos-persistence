@@ -350,18 +350,19 @@ async def test_outbox_leases_retry_and_complete_without_two_workers_owning_a_row
         assert first[0].publish_attempts == 1
         assert await repository.claim_outbox("worker-2", producer="integration-producer", limit=1) == []
 
-        assert await repository.fail_outbox(
-            first[0].id,
-            "worker-1",
-            "temporary transport error",
-            retry_after=timedelta(0),
-            max_attempts=3,
+        assert await repository.mark_outbox_publish_outcome_unknown(
+            first[0], "worker-1", reason_code="PUBLISH_EXCEPTION"
         )
         second = await repository.claim_outbox("worker-2", producer="integration-producer", limit=1)
-        assert len(second) == 1
-        assert second[0].publish_attempts == 2
-        assert await repository.mark_published(second[0].id, "worker-2")
-        assert not await repository.mark_published(second[0].id, "worker-1")
+        assert second == []
+        state = await database.pool.fetchrow(
+            """SELECT reconciliation_state, publish_attempts, last_error
+                 FROM message_outbox WHERE message_id=$1""",
+            message_id,
+        )
+        assert state["reconciliation_state"] == "PUBLISH_OUTCOME_UNKNOWN"
+        assert state["publish_attempts"] == 1
+        assert state["last_error"] == "automatic_dispatch:PUBLISH_EXCEPTION"
     finally:
         await database.pool.execute("DELETE FROM message_outbox WHERE message_id=$1", message_id)
         await database.close()

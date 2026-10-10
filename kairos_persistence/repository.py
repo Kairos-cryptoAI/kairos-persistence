@@ -13,9 +13,15 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from types import TracebackType
 from typing import Any
+from uuid import uuid4
 
 import asyncpg
 from kairos_core.contracts.base import KairosMessage
+
+from .redis_acceptance_evidence import (
+    REDIS_ACCEPTANCE_RESOLUTION_SCHEMA,
+    RedisAcceptanceEvidenceV1,
+)
 
 OFFLINE_OUTBOX_RECONCILIATION_MIGRATION = "018_offline_outbox_reconciliation.sql"
 
@@ -36,6 +42,7 @@ class OutboxRecord:
     payload: dict[str, Any]
     payload_sha256: str | None
     publish_attempts: int
+    reconciliation_id: str
 
 
 class OfflineOutboxClaimState(StrEnum):
@@ -68,6 +75,33 @@ class OfflineOutboxQuarantineState(StrEnum):
     QUARANTINED = "QUARANTINED"
     ALREADY_QUARANTINED = "ALREADY_QUARANTINED"
     REJECTED = "REJECTED"
+
+
+class OfflineOutboxTransportResolutionState(StrEnum):
+    """Outcome of resolving an UNKNOWN row from positive Redis evidence only."""
+
+    RESOLVED = "RESOLVED"
+    ALREADY_RESOLVED = "ALREADY_RESOLVED"
+    NO_MATCH_REMAINS_UNKNOWN = "NO_MATCH_REMAINS_UNKNOWN"
+    MULTIPLE_MATCHES_CONFLICT = "MULTIPLE_MATCHES_CONFLICT"
+    REJECTED = "REJECTED"
+
+
+class OfflineOutboxTransportResolutionRejection(StrEnum):
+    """Fail-closed reasons an exact positive transport resolution was refused."""
+
+    MIGRATION_018_REQUIRED = "MIGRATION_018_REQUIRED"
+    NOT_FOUND = "NOT_FOUND"
+    IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+    EVIDENCE_MISMATCH = "EVIDENCE_MISMATCH"
+    AUDIT_MISMATCH = "AUDIT_MISMATCH"
+    PAYLOAD_HASH_MISMATCH = "PAYLOAD_HASH_MISMATCH"
+    RECONCILIATION_ID_MISMATCH = "RECONCILIATION_ID_MISMATCH"
+    RECONCILIATION_NOT_UNKNOWN = "RECONCILIATION_NOT_UNKNOWN"
+    INCONSISTENT_PUBLISHED_STATE = "INCONSISTENT_PUBLISHED_STATE"
+    QUARANTINE_METADATA_INVALID = "QUARANTINE_METADATA_INVALID"
+    EVIDENCE_TOO_LARGE = "EVIDENCE_TOO_LARGE"
+    RACE_LOST = "RACE_LOST"
 
 
 class OfflineOutboxQuarantineRejection(StrEnum):
@@ -206,6 +240,50 @@ class OfflineOutboxQuarantineResult:
                 raise ValueError("quarantined offline outbox result requires only a durable receipt")
         elif self.receipt is not None or self.rejection is None:
             raise ValueError("rejected offline outbox result requires only a rejection")
+
+
+@dataclass(frozen=True)
+class OfflineOutboxTransportResolutionReceipt:
+    """Payload-free proof that Redis already accepted this exact outbox effect."""
+
+    identity: OfflineOutboxIdentity
+    reconciliation_id: str
+    evidence: RedisAcceptanceEvidenceV1
+    resolved_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reconciliation_id, str) or not self.reconciliation_id.strip():
+            raise ValueError("offline transport receipt reconciliation_id must be non-empty")
+        if not isinstance(self.resolved_at, datetime) or self.resolved_at.tzinfo is None:
+            raise ValueError("offline transport receipt resolved_at must be timezone-aware")
+
+
+@dataclass(frozen=True)
+class OfflineOutboxTransportResolutionResult:
+    """A safe no-match/conflict, a positive resolution, or a concrete refusal."""
+
+    state: OfflineOutboxTransportResolutionState
+    identity: OfflineOutboxIdentity
+    receipt: OfflineOutboxTransportResolutionReceipt | None = None
+    rejection: OfflineOutboxTransportResolutionRejection | None = None
+
+    def __post_init__(self) -> None:
+        receipt_states = {
+            OfflineOutboxTransportResolutionState.RESOLVED,
+            OfflineOutboxTransportResolutionState.ALREADY_RESOLVED,
+        }
+        safe_nonmutating_states = {
+            OfflineOutboxTransportResolutionState.NO_MATCH_REMAINS_UNKNOWN,
+            OfflineOutboxTransportResolutionState.MULTIPLE_MATCHES_CONFLICT,
+        }
+        if self.state in receipt_states:
+            if self.receipt is None or self.rejection is not None:
+                raise ValueError("resolved transport result requires only a receipt")
+        elif self.state in safe_nonmutating_states:
+            if self.receipt is not None or self.rejection is not None:
+                raise ValueError("non-mutating transport result cannot carry receipt or rejection")
+        elif self.receipt is not None or self.rejection is None:
+            raise ValueError("rejected transport result requires only a rejection")
 
 
 class MessageIdentityConflict(RuntimeError):
@@ -1017,6 +1095,254 @@ class AuditRepository:
                     receipt=receipt,
                 )
 
+    async def resolve_unknown_outbox_from_redis_evidence(
+        self,
+        identity: OfflineOutboxIdentity,
+        *,
+        reconciliation_id: str,
+        evidence: RedisAcceptanceEvidenceV1,
+    ) -> OfflineOutboxTransportResolutionResult:
+        """Resolve one UNKNOWN row only when a controller proves one exact Redis match.
+
+        This DB-only API has no publisher or Redis connection. It is intended
+        for an authenticated operator/controller after a read-only stream probe;
+        the ordinary dispatcher must never call it. Zero matches stay UNKNOWN
+        because Redis trimming/deletion makes absence inconclusive. Multiple
+        matches are an explicit conflict and are never replayed. A unique exact
+        match marks the row ACKNOWLEDGED without changing its attempt count or
+        quarantine lease metadata. The original ``last_error`` is preserved
+        verbatim inside a versioned payload-free resolution record so exact
+        evidence can be checked idempotently using the existing 018 columns.
+        """
+        if not isinstance(evidence, RedisAcceptanceEvidenceV1):
+            raise ValueError("offline transport resolution requires typed Redis evidence")
+        reconciliation_id = self._require_reconciliation_id(reconciliation_id)
+        if (
+            evidence.topic != identity.topic
+            or evidence.message_id != identity.message_id
+            or evidence.canonical_payload_sha256 != identity.payload_sha256
+        ):
+            return OfflineOutboxTransportResolutionResult(
+                state=OfflineOutboxTransportResolutionState.REJECTED,
+                identity=identity,
+                rejection=OfflineOutboxTransportResolutionRejection.EVIDENCE_MISMATCH,
+            )
+        if evidence.match_count == 0:
+            return OfflineOutboxTransportResolutionResult(
+                state=OfflineOutboxTransportResolutionState.NO_MATCH_REMAINS_UNKNOWN,
+                identity=identity,
+            )
+        if evidence.match_count > 1:
+            return OfflineOutboxTransportResolutionResult(
+                state=OfflineOutboxTransportResolutionState.MULTIPLE_MATCHES_CONFLICT,
+                identity=identity,
+            )
+
+        identity_document = {
+            "id": identity.id,
+            "producer": identity.producer,
+            "message_id": identity.message_id,
+            "topic": identity.topic,
+            "payload_sha256": identity.payload_sha256,
+            "publish_attempts": identity.publish_attempts,
+        }
+        evidence_document = evidence.document()
+
+        def rejected(reason: OfflineOutboxTransportResolutionRejection):
+            return OfflineOutboxTransportResolutionResult(
+                state=OfflineOutboxTransportResolutionState.REJECTED,
+                identity=identity,
+                rejection=reason,
+            )
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                migration_table_exists = await connection.fetchval(
+                    "SELECT to_regclass('schema_migrations') IS NOT NULL"
+                )
+                if not migration_table_exists:
+                    return rejected(OfflineOutboxTransportResolutionRejection.MIGRATION_018_REQUIRED)
+                migration_applied = await connection.fetchval(
+                    "SELECT 1 FROM schema_migrations WHERE version=$1",
+                    OFFLINE_OUTBOX_RECONCILIATION_MIGRATION,
+                )
+                if not migration_applied:
+                    return rejected(OfflineOutboxTransportResolutionRejection.MIGRATION_018_REQUIRED)
+
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"offline-outbox-reconciliation:{identity.id}",
+                )
+                row = await connection.fetchrow(
+                    """SELECT id, producer, message_id, topic, payload, payload_sha256,
+                              publish_attempts, published_at, dead_lettered_at,
+                              lease_owner, lease_until, last_error, reconciliation_state,
+                              reconciliation_id, reconciliation_started_at,
+                              reconciliation_outcome_at
+                         FROM message_outbox
+                        WHERE id=$1
+                        FOR UPDATE""",
+                    identity.id,
+                )
+                if row is None:
+                    return rejected(OfflineOutboxTransportResolutionRejection.NOT_FOUND)
+                if any(row[name] != expected for name, expected in identity_document.items()):
+                    return rejected(OfflineOutboxTransportResolutionRejection.IDENTITY_MISMATCH)
+
+                try:
+                    payload, payload_sha256 = self._canonical_outbox_payload(row["payload"])
+                except ValueError:
+                    return rejected(OfflineOutboxTransportResolutionRejection.PAYLOAD_HASH_MISMATCH)
+                if (
+                    payload_sha256 != identity.payload_sha256
+                    or payload.get("message_id") != identity.message_id
+                ):
+                    return rejected(OfflineOutboxTransportResolutionRejection.PAYLOAD_HASH_MISMATCH)
+
+                audit_rows = await connection.fetch(
+                    """SELECT topic, payload
+                         FROM event_audit
+                        WHERE message_id=$1
+                        FOR UPDATE""",
+                    identity.message_id,
+                )
+                if len(audit_rows) != 1:
+                    return rejected(OfflineOutboxTransportResolutionRejection.AUDIT_MISMATCH)
+                try:
+                    audit_payload, audit_sha256 = self._canonical_outbox_payload(audit_rows[0]["payload"])
+                except ValueError:
+                    return rejected(OfflineOutboxTransportResolutionRejection.AUDIT_MISMATCH)
+                if (
+                    audit_rows[0]["topic"] != identity.topic
+                    or audit_sha256 != identity.payload_sha256
+                    or audit_payload != payload
+                    or audit_payload.get("message_id") != identity.message_id
+                ):
+                    return rejected(OfflineOutboxTransportResolutionRejection.AUDIT_MISMATCH)
+
+                if row["reconciliation_id"] != reconciliation_id:
+                    return rejected(OfflineOutboxTransportResolutionRejection.RECONCILIATION_ID_MISMATCH)
+                if row["reconciliation_state"] == "ACKNOWLEDGED":
+                    if (
+                        row["published_at"] is None
+                        or row["dead_lettered_at"] is not None
+                        or row["lease_owner"] is not None
+                        or row["lease_until"] is not None
+                    ):
+                        return rejected(
+                            OfflineOutboxTransportResolutionRejection.INCONSISTENT_PUBLISHED_STATE
+                        )
+                    try:
+                        stored = json.loads(row["last_error"])
+                    except (TypeError, json.JSONDecodeError):
+                        return rejected(OfflineOutboxTransportResolutionRejection.EVIDENCE_MISMATCH)
+                    if (
+                        not isinstance(stored, dict)
+                        or set(stored)
+                        != {
+                            "schema",
+                            "reconciliation_id",
+                            "identity",
+                            "evidence",
+                            "evidence_sha256",
+                            "legacy_last_error",
+                        }
+                        or stored.get("schema") != REDIS_ACCEPTANCE_RESOLUTION_SCHEMA
+                        or stored.get("reconciliation_id") != reconciliation_id
+                        or stored.get("identity") != identity_document
+                        or stored.get("evidence") != evidence_document
+                        or stored.get("evidence_sha256") != evidence.sha256
+                        or not isinstance(stored.get("legacy_last_error"), str)
+                    ):
+                        return rejected(OfflineOutboxTransportResolutionRejection.EVIDENCE_MISMATCH)
+                    return OfflineOutboxTransportResolutionResult(
+                        state=OfflineOutboxTransportResolutionState.ALREADY_RESOLVED,
+                        identity=identity,
+                        receipt=OfflineOutboxTransportResolutionReceipt(
+                            identity=identity,
+                            reconciliation_id=reconciliation_id,
+                            evidence=evidence,
+                            resolved_at=row["published_at"],
+                        ),
+                    )
+                if row["reconciliation_state"] != "PUBLISH_OUTCOME_UNKNOWN":
+                    return rejected(OfflineOutboxTransportResolutionRejection.RECONCILIATION_NOT_UNKNOWN)
+                if (
+                    row["published_at"] is not None
+                    or row["dead_lettered_at"] is not None
+                    or row["lease_owner"] is not None
+                    or row["lease_until"] is not None
+                ):
+                    return rejected(OfflineOutboxTransportResolutionRejection.INCONSISTENT_PUBLISHED_STATE)
+                if (
+                    not isinstance(row["last_error"], str)
+                    or not row["last_error"]
+                    or not isinstance(row["reconciliation_started_at"], datetime)
+                    or not isinstance(row["reconciliation_outcome_at"], datetime)
+                    or row["reconciliation_started_at"].tzinfo is None
+                    or row["reconciliation_outcome_at"].tzinfo is None
+                ):
+                    return rejected(OfflineOutboxTransportResolutionRejection.QUARANTINE_METADATA_INVALID)
+
+                record = {
+                    "schema": REDIS_ACCEPTANCE_RESOLUTION_SCHEMA,
+                    "reconciliation_id": reconciliation_id,
+                    "identity": identity_document,
+                    "evidence": evidence_document,
+                    "evidence_sha256": evidence.sha256,
+                    "legacy_last_error": row["last_error"],
+                }
+                resolution_evidence = json.dumps(
+                    record, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                )
+                if len(resolution_evidence.encode("utf-8")) > 4000:
+                    return rejected(OfflineOutboxTransportResolutionRejection.EVIDENCE_TOO_LARGE)
+
+                updated = await connection.fetchrow(
+                    """UPDATE message_outbox
+                           SET published_at=now(),
+                               reconciliation_state='ACKNOWLEDGED',
+                               last_error=$7
+                         WHERE id=$1
+                           AND producer=$2
+                           AND message_id=$3
+                           AND topic=$4
+                           AND payload_sha256=$5
+                           AND publish_attempts=$6
+                           AND reconciliation_state='PUBLISH_OUTCOME_UNKNOWN'
+                           AND reconciliation_id=$8
+                           AND published_at IS NULL
+                           AND dead_lettered_at IS NULL
+                           AND lease_owner IS NULL
+                           AND lease_until IS NULL
+                           AND last_error=$9
+                     RETURNING published_at""",
+                    identity.id,
+                    identity.producer,
+                    identity.message_id,
+                    identity.topic,
+                    identity.payload_sha256,
+                    identity.publish_attempts,
+                    resolution_evidence,
+                    reconciliation_id,
+                    row["last_error"],
+                )
+                if updated is None:
+                    return rejected(OfflineOutboxTransportResolutionRejection.RACE_LOST)
+                resolved_at = updated["published_at"]
+                if not isinstance(resolved_at, datetime) or resolved_at.tzinfo is None:
+                    raise RuntimeError("Redis acceptance resolution returned no durable timestamp")
+                return OfflineOutboxTransportResolutionResult(
+                    state=OfflineOutboxTransportResolutionState.RESOLVED,
+                    identity=identity,
+                    receipt=OfflineOutboxTransportResolutionReceipt(
+                        identity=identity,
+                        reconciliation_id=reconciliation_id,
+                        evidence=evidence,
+                        resolved_at=resolved_at,
+                    ),
+                )
+
     async def claim_expired_outbox_exact(
         self,
         identity: OfflineOutboxIdentity,
@@ -1337,6 +1663,7 @@ class AuditRepository:
     ) -> list[OutboxRecord]:
         if not producer.strip():
             raise ValueError("outbox producer must not be empty")
+        reconciliation_id = f"dispatch:{uuid4().hex}"
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 rows = await connection.fetch(
@@ -1347,8 +1674,10 @@ class AuditRepository:
                               AND outbox.published_at IS NULL
                               AND outbox.dead_lettered_at IS NULL
                               AND outbox.reconciliation_state='NONE'
+                              AND outbox.publish_attempts=0
                               AND outbox.available_at <= now()
-                              AND (outbox.lease_until IS NULL OR outbox.lease_until < now())
+                              AND outbox.lease_owner IS NULL
+                              AND outbox.lease_until IS NULL
                               AND NOT EXISTS (
                                   SELECT 1
                                     FROM message_outbox AS prior
@@ -1363,22 +1692,31 @@ class AuditRepository:
                        ), claimed AS (
                            UPDATE message_outbox AS outbox
                            SET lease_owner=$1, lease_until=now()+$3::interval,
-                               publish_attempts=publish_attempts+1
+                               publish_attempts=publish_attempts+1,
+                               reconciliation_state='PUBLISHING',
+                               reconciliation_id=$5,
+                               reconciliation_started_at=now(),
+                               reconciliation_outcome_at=NULL,
+                               last_error=NULL
                            FROM candidates
                            WHERE outbox.id=candidates.id
+                             AND outbox.publish_attempts=0
+                             AND outbox.lease_owner IS NULL
+                             AND outbox.lease_until IS NULL
                            RETURNING outbox.id, outbox.producer, outbox.message_id,
                                      outbox.topic, outbox.payload, outbox.payload_sha256,
-                                     outbox.publish_attempts
+                                     outbox.publish_attempts, outbox.reconciliation_id
                        )
                        SELECT * FROM claimed ORDER BY id""",
                     worker_id,
                     limit,
                     lease,
                     producer,
+                    reconciliation_id,
                 )
-        # One producer head is leased at a time.  An earlier retry therefore
-        # cannot be overtaken, and two replicas cannot publish adjacent causal
-        # messages concurrently.
+        # One producer head is claimed at a time and committed as PUBLISHING
+        # before the caller can send it.  Any unresolved earlier row therefore
+        # blocks later causal messages instead of being automatically retried.
         return [
             OutboxRecord(
                 id=row["id"],
@@ -1388,17 +1726,72 @@ class AuditRepository:
                 payload=(json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]),
                 payload_sha256=row["payload_sha256"],
                 publish_attempts=row["publish_attempts"],
+                reconciliation_id=row["reconciliation_id"],
             )
             for row in sorted(rows, key=lambda row: row["id"])
         ]
 
-    async def mark_published(self, row_id: int, worker_id: str) -> bool:
+    async def mark_published(self, record: OutboxRecord, worker_id: str) -> bool:
+        """ACK only the exact durable claim returned to this worker."""
         status = await self.pool.execute(
-            """UPDATE message_outbox SET published_at=now(), lease_until=NULL, lease_owner=NULL,
-               last_error=NULL WHERE id=$1 AND lease_owner=$2 AND published_at IS NULL
-               AND reconciliation_state='NONE'""",
-            row_id,
+            """UPDATE message_outbox
+                  SET published_at=now(), lease_until=NULL, lease_owner=NULL,
+                      last_error=NULL, reconciliation_state='ACKNOWLEDGED',
+                      reconciliation_outcome_at=now()
+                WHERE id=$1 AND producer=$2 AND message_id=$3 AND topic=$4
+                  AND payload_sha256 IS NOT DISTINCT FROM $5
+                  AND publish_attempts=$6 AND lease_owner=$7
+                  AND reconciliation_id=$8 AND reconciliation_state='PUBLISHING'
+                  AND published_at IS NULL AND dead_lettered_at IS NULL""",
+            record.id,
+            record.producer,
+            record.message_id,
+            record.topic,
+            record.payload_sha256,
+            record.publish_attempts,
             worker_id,
+            record.reconciliation_id,
+        )
+        return status.endswith("1")
+
+    async def mark_outbox_publish_outcome_unknown(
+        self,
+        record: OutboxRecord,
+        worker_id: str,
+        *,
+        reason_code: str,
+    ) -> bool:
+        """Fail closed after claim; only bounded internal categories are persisted."""
+        allowed_reasons = {
+            "PRE_PUBLISH_HASH_MISMATCH",
+            "PUBLISH_EXCEPTION",
+            "PUBLISH_CANCELLED",
+            "ACK_NOT_APPLIED",
+            "ACK_EXCEPTION",
+            "ACK_CANCELLED",
+        }
+        if reason_code not in allowed_reasons:
+            raise ValueError("unknown automatic outbox failure category")
+        status = await self.pool.execute(
+            """UPDATE message_outbox
+                  SET lease_until=NULL, lease_owner=NULL,
+                      last_error=$9,
+                      reconciliation_state='PUBLISH_OUTCOME_UNKNOWN',
+                      reconciliation_outcome_at=now()
+                WHERE id=$1 AND producer=$2 AND message_id=$3 AND topic=$4
+                  AND payload_sha256 IS NOT DISTINCT FROM $5
+                  AND publish_attempts=$6 AND lease_owner=$7
+                  AND reconciliation_id=$8 AND reconciliation_state='PUBLISHING'
+                  AND published_at IS NULL AND dead_lettered_at IS NULL""",
+            record.id,
+            record.producer,
+            record.message_id,
+            record.topic,
+            record.payload_sha256,
+            record.publish_attempts,
+            worker_id,
+            record.reconciliation_id,
+            f"automatic_dispatch:{reason_code}",
         )
         return status.endswith("1")
 
