@@ -68,6 +68,7 @@ class Connection:
         self.events = []
         self.in_transaction = False
         self.terminated = False
+        self.runtime_privilege_query = None
         self.session = {
             "state": "RUNNING",
             "scope": scope().model_dump(mode="json"),
@@ -92,6 +93,7 @@ class Connection:
 
     async def fetchrow(self, sql, *args):
         if "current_user AS runtime_actor" in sql:
+            self.runtime_privilege_query = sql
             return (
                 dict(
                     runtime_actor="kairos_runtime",
@@ -102,11 +104,15 @@ class Connection:
                     rolreplication=False,
                     operator_member=False,
                     schema_create=False,
+                    schema_usage=True,
+                    database_connect=True,
                     owns_database=False,
                     owns_control_functions=False,
                     owns_runtime_tables=False,
                     unsafe_control_write=False,
                     table_count=4,
+                    required_control_select=True,
+                    required_runtime_insert=True,
                 )
                 | self.runtime_flags
             )
@@ -257,11 +263,40 @@ async def test_runtime_privilege_separation_is_mandatory_for_admission(state, fl
 async def test_runtime_privilege_probe_is_verify_only_and_sanitizes_backend_failure(state):
     connection, repository = state
     await repository.verify_runtime_access()
+    assert connection.runtime_privilege_query is not None
+    query = "".join(connection.runtime_privilege_query.split())
+    assert "has_schema_privilege(current_user,'public','USAGE')ASschema_usage" in query
+    assert "has_database_privilege(current_user,current_database(),'CONNECT')ASdatabase_connect" in query
+    assert (
+        "bool_and(has_table_privilege(current_user,c.oid,'SELECT'))FROMpg_catalog.pg_classc"
+        "JOINpg_catalog.pg_namespacenONn.oid=c.relnamespaceWHEREn.nspname='public'"
+        "ANDc.relkindIN('r','p')ANDc.relnameIN('operator_controls','operator_control_commands',"
+        "'operator_control_admissions','operator_control_dispatch_claims')),FALSE)"
+        "ASrequired_control_select"
+    ) in query
+    assert (
+        "bool_and(has_table_privilege(current_user,c.oid,'INSERT'))FROMpg_catalog.pg_classc"
+        "JOINpg_catalog.pg_namespacenONn.oid=c.relnamespaceWHEREn.nspname='public'"
+        "ANDc.relkindIN('r','p')ANDc.relnameIN('operator_control_admissions',"
+        "'operator_control_dispatch_claims')),FALSE)ASrequired_runtime_insert"
+    ) in query
     connection.fetchrow = AsyncMock(side_effect=RuntimeError("private-dsn-placeholder"))
     with pytest.raises(OperatorControlUnavailable, match="privileges cannot be verified") as error:
         await repository.verify_runtime_access()
     assert "private-dsn-placeholder" not in str(error.value)
     assert error.value.__suppress_context__
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing_grant",
+    ["database_connect", "schema_usage", "required_control_select", "required_runtime_insert"],
+)
+async def test_runtime_access_fails_closed_when_any_required_grant_is_missing(state, missing_grant):
+    connection, repository = state
+    connection.runtime_flags[missing_grant] = False
+    with pytest.raises(OperatorControlRefused, match="separated database roles"):
+        await repository.verify_runtime_access()
 
 
 @pytest.mark.asyncio

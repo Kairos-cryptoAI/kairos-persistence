@@ -147,6 +147,8 @@ class OperatorControlRepository:
                r.rolcreaterole,r.rolcreatedb,r.rolreplication,
                pg_has_role(current_user,'kairos_operator','MEMBER') AS operator_member,
                has_schema_privilege(current_user,'public','CREATE') AS schema_create,
+               has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
+               has_database_privilege(current_user,current_database(),'CONNECT') AS database_connect,
                pg_has_role(current_user,d.datdba,'MEMBER') AS owns_database,
                EXISTS(SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n
                  ON n.oid=p.pronamespace WHERE n.nspname='public' AND p.proname IN
@@ -156,6 +158,19 @@ class OperatorControlRepository:
                 ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r'
                 AND c.relname IN ('operator_controls','operator_control_commands',
                   'operator_control_admissions','operator_control_dispatch_claims')) AS table_count,
+                COALESCE((SELECT bool_and(has_table_privilege(current_user,c.oid,'SELECT'))
+                  FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
+                    ON n.oid=c.relnamespace
+                  WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname IN
+                    ('operator_controls','operator_control_commands',
+                     'operator_control_admissions','operator_control_dispatch_claims')),FALSE)
+                  AS required_control_select,
+                COALESCE((SELECT bool_and(has_table_privilege(current_user,c.oid,'INSERT'))
+                  FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
+                    ON n.oid=c.relnamespace
+                  WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname IN
+                    ('operator_control_admissions','operator_control_dispatch_claims')),FALSE)
+                  AS required_runtime_insert,
                EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
                  ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p')
                  AND pg_has_role(current_user,c.relowner,'MEMBER')) AS owns_runtime_tables,
@@ -178,11 +193,15 @@ class OperatorControlRepository:
             or role["rolreplication"]
             or role["operator_member"]
             or role["schema_create"]
+            or not role["schema_usage"]
+            or not role["database_connect"]
             or role["owns_database"]
             or role["owns_control_functions"]
             or role["owns_runtime_tables"]
             or role["unsafe_control_write"]
             or role["table_count"] != 4
+            or not role["required_control_select"]
+            or not role["required_runtime_insert"]
         ):
             raise OperatorControlRefused(
                 "runtime operator control requires independently separated database roles"
