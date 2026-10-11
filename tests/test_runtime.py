@@ -508,9 +508,7 @@ def test_consumer_only_option_requires_an_explicit_boolean():
 @pytest.mark.asyncio
 async def test_consumer_only_rejects_simulator_profile_before_connecting():
     database = _consumer_only_database(MigrationProfile.SIMULATOR)
-    runtime = DurableMessageBus(
-        _Transport([]), service_name="ingest", database=database, consumer_only=True
-    )
+    runtime = DurableMessageBus(_Transport([]), service_name="ingest", database=database, consumer_only=True)
 
     with pytest.raises(RuntimeError, match="requires a runtime or controlled-runtime"):
         await runtime.start()
@@ -608,9 +606,7 @@ async def test_consumer_only_subscribe_is_lazy_verifies_schema_and_never_starts_
     repository = _Repository(events)
     monkeypatch.setattr("kairos_persistence.runtime.AuditRepository", lambda pool: repository)
     transport = _ObservedTransport([envelope])
-    runtime = DurableMessageBus(
-        transport, service_name="ingest", database=database, consumer_only=True
-    )
+    runtime = DurableMessageBus(transport, service_name="ingest", database=database, consumer_only=True)
     monkeypatch.setattr(runtime, "_verify_consumer_access", AsyncMock())
 
     stream = runtime.subscribe("input", group="workers", consumer="one")
@@ -638,9 +634,7 @@ async def test_consumer_only_subscribe_is_lazy_verifies_schema_and_never_starts_
 @pytest.mark.asyncio
 async def test_consumer_only_publish_refuses_before_start_or_any_database_call():
     database = _consumer_only_database()
-    runtime = DurableMessageBus(
-        _Transport([]), service_name="ingest", database=database, consumer_only=True
-    )
+    runtime = DurableMessageBus(_Transport([]), service_name="ingest", database=database, consumer_only=True)
 
     with pytest.raises(RuntimeError, match="publish is disabled in consumer-only mode"):
         await runtime.publish("output", _payload("outgoing-1"))
@@ -660,9 +654,7 @@ async def test_consumer_only_failed_handler_is_not_acked_and_does_not_wake_dispa
     repository = _Repository(events)
     monkeypatch.setattr("kairos_persistence.runtime.AuditRepository", lambda pool: repository)
     transport = _Transport([envelope])
-    runtime = DurableMessageBus(
-        transport, service_name="ingest", database=database, consumer_only=True
-    )
+    runtime = DurableMessageBus(transport, service_name="ingest", database=database, consumer_only=True)
     monkeypatch.setattr(runtime, "_verify_consumer_access", AsyncMock())
 
     stream = runtime.subscribe("input", group="workers")
