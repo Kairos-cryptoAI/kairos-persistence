@@ -483,3 +483,194 @@ async def test_controlled_profile_rejects_unsafe_runtime_before_outbox(monkeypat
     probe.assert_awaited_once()
     database.migrate.assert_not_called()
     assert not runtime._started and runtime._dispatcher is None
+
+
+def _consumer_only_database(profile=MigrationProfile.RUNTIME):
+    return type(
+        "Database",
+        (),
+        {
+            "connect": AsyncMock(),
+            "migrate": AsyncMock(),
+            "verify_schema": AsyncMock(),
+            "migration_profile": profile,
+            "pool": object(),
+            "close": AsyncMock(),
+        },
+    )()
+
+
+def test_consumer_only_option_requires_an_explicit_boolean():
+    with pytest.raises(TypeError, match="consumer_only must be a bool"):
+        DurableMessageBus(_Transport([]), service_name="ingest", consumer_only="yes")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_consumer_only_rejects_simulator_profile_before_connecting():
+    database = _consumer_only_database(MigrationProfile.SIMULATOR)
+    runtime = DurableMessageBus(
+        _Transport([]), service_name="ingest", database=database, consumer_only=True
+    )
+
+    with pytest.raises(RuntimeError, match="requires a runtime or controlled-runtime"):
+        await runtime.start()
+
+    database.connect.assert_not_called()
+    database.verify_schema.assert_not_called()
+    assert runtime._dispatcher is None
+
+
+@pytest.mark.asyncio
+async def test_consumer_only_privilege_probe_requires_inbox_audit_and_denies_outbox_writes():
+    class _Connection:
+        def __init__(self, row: dict[str, bool]) -> None:
+            self.row = row
+            self.sql = ""
+
+        @asynccontextmanager
+        async def transaction(self, *, readonly: bool = False):
+            assert readonly
+            yield
+
+        async def fetchrow(self, sql: str):
+            self.sql = sql
+            return self.row
+
+    class _Acquire:
+        def __init__(self, connection: _Connection) -> None:
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class _Pool:
+        def __init__(self, connection: _Connection) -> None:
+            self.connection = connection
+
+        def acquire(self):
+            return _Acquire(self.connection)
+
+    good_row = {
+        "rolsuper": False,
+        "rolbypassrls": False,
+        "rolcreaterole": False,
+        "rolcreatedb": False,
+        "rolreplication": False,
+        "schema_create": False,
+        "schema_usage": True,
+        "database_connect": True,
+        "owns_database": False,
+        "owns_runtime_tables": False,
+        "schema_history_select": True,
+        "audit_access": True,
+        "inbox_access": True,
+        "outbox_write_access": False,
+    }
+    connection = _Connection(good_row)
+    runtime = DurableMessageBus(
+        _Transport([]), service_name="ingest", database=type("DB", (), {"pool": _Pool(connection)})()
+    )
+    await runtime._verify_consumer_access()
+    sql = " ".join(connection.sql.split())
+    assert "message_outbox" in sql
+    assert "INSERT,UPDATE,DELETE,TRUNCATE" in sql
+    assert (
+        "has_table_privilege(current_user,c.oid,'SELECT') "
+        "AND has_table_privilege(current_user,c.oid,'INSERT')"
+    ) in sql
+    assert (
+        "has_table_privilege(current_user,c.oid,'SELECT') "
+        "AND has_table_privilege(current_user,c.oid,'INSERT') "
+        "AND has_table_privilege(current_user,c.oid,'UPDATE')"
+    ) in sql
+    assert "has_table_privilege(current_user,c.oid,'SELECT,INSERT')" not in sql
+    assert "has_table_privilege(current_user,c.oid,'SELECT,INSERT,UPDATE')" not in sql
+
+    good_row["outbox_write_access"] = True
+    with pytest.raises(PermissionError, match="least-privilege grants"):
+        await runtime._verify_consumer_access()
+
+
+@pytest.mark.asyncio
+async def test_consumer_only_subscribe_is_lazy_verifies_schema_and_never_starts_dispatcher(monkeypatch):
+    events: list[str] = []
+    envelope = BusEnvelope(id="redis-1", topic="input", payload=_payload("incoming-1"))
+
+    class _ObservedTransport(_Transport):
+        async def ack(self, topic: str, envelope: BusEnvelope, *, group: str | None = None) -> None:
+            events.append("redis-ack")
+            await super().ack(topic, envelope, group=group)
+
+    database = _consumer_only_database()
+    repository = _Repository(events)
+    monkeypatch.setattr("kairos_persistence.runtime.AuditRepository", lambda pool: repository)
+    transport = _ObservedTransport([envelope])
+    runtime = DurableMessageBus(
+        transport, service_name="ingest", database=database, consumer_only=True
+    )
+    monkeypatch.setattr(runtime, "_verify_consumer_access", AsyncMock())
+
+    stream = runtime.subscribe("input", group="workers", consumer="one")
+    database.connect.assert_not_called()
+    database.verify_schema.assert_not_called()
+    assert runtime._dispatcher is None
+
+    received = await anext(stream)
+    await runtime.ack("input", received, group="workers")
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+    assert database.connect.await_count == 1
+    database.verify_schema.assert_awaited_once()
+    database.migrate.assert_not_called()
+    assert runtime._dispatcher is None
+    assert events == ["inbox-begin", "inbox-complete", "inbox-commit", "redis-ack"]
+    assert transport.acked == [("input", "redis-1", "workers")]
+    assert not runtime._wake_dispatcher.is_set()
+    await runtime.close()
+    assert database.close.await_count == 1
+    assert transport.closed
+
+
+@pytest.mark.asyncio
+async def test_consumer_only_publish_refuses_before_start_or_any_database_call():
+    database = _consumer_only_database()
+    runtime = DurableMessageBus(
+        _Transport([]), service_name="ingest", database=database, consumer_only=True
+    )
+
+    with pytest.raises(RuntimeError, match="publish is disabled in consumer-only mode"):
+        await runtime.publish("output", _payload("outgoing-1"))
+
+    database.connect.assert_not_called()
+    database.verify_schema.assert_not_called()
+    database.migrate.assert_not_called()
+    assert not runtime._started
+    assert runtime._dispatcher is None
+
+
+@pytest.mark.asyncio
+async def test_consumer_only_failed_handler_is_not_acked_and_does_not_wake_dispatcher(monkeypatch):
+    events: list[str] = []
+    envelope = BusEnvelope(id="redis-1", topic="input", payload=_payload("incoming-1"))
+    database = _consumer_only_database()
+    repository = _Repository(events)
+    monkeypatch.setattr("kairos_persistence.runtime.AuditRepository", lambda pool: repository)
+    transport = _Transport([envelope])
+    runtime = DurableMessageBus(
+        transport, service_name="ingest", database=database, consumer_only=True
+    )
+    monkeypatch.setattr(runtime, "_verify_consumer_access", AsyncMock())
+
+    stream = runtime.subscribe("input", group="workers")
+    assert await anext(stream) is envelope
+    with pytest.raises(RuntimeError, match="handler failed"):
+        await stream.athrow(RuntimeError("handler failed"))
+
+    assert events == ["inbox-begin", "inbox-failed"]
+    assert transport.acked == []
+    assert runtime._dispatcher is None
+    assert not runtime._wake_dispatcher.is_set()

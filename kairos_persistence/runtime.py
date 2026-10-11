@@ -78,15 +78,19 @@ class DurableMessageBus(MessageBus):
         database: Database | None = None,
         verify_schema_only: bool = False,
         required_migration_profile: MigrationProfile | None = None,
+        consumer_only: bool = False,
     ) -> None:
         if not service_name.strip():
             raise ValueError("service_name must not be empty")
+        if not isinstance(consumer_only, bool):
+            raise TypeError("consumer_only must be a bool")
         self.transport = transport
         self.service_name = service_name.strip()
         self.settings = settings or PersistenceSettings()
         self.database = database or Database(self.settings)
         self.verify_schema_only = verify_schema_only
         self.required_migration_profile = required_migration_profile
+        self.consumer_only = consumer_only
         self.repository: AuditRepository | None = None
         self._delivery: ContextVar[_Delivery | None] = ContextVar(f"kairos_delivery_{id(self)}", default=None)
         self._start_lock = asyncio.Lock()
@@ -111,23 +115,97 @@ class DurableMessageBus(MessageBus):
                 raise RuntimeError(
                     "PAPER requires explicit, independently prepared controlled-runtime schema"
                 )
+            if self.consumer_only and self.database.migration_profile not in (
+                MigrationProfile.RUNTIME,
+                MigrationProfile.CONTROLLED_RUNTIME,
+            ):
+                raise RuntimeError(
+                    "consumer-only mode requires a runtime or controlled-runtime schema profile"
+                )
             await self.database.connect()
             if (
-                self.verify_schema_only
+                self.consumer_only
+                or self.verify_schema_only
                 or self.database.migration_profile is MigrationProfile.CONTROLLED_RUNTIME
             ):
                 await self.database.verify_schema()
             else:
                 await self.database.migrate()
-            if self.database.migration_profile is MigrationProfile.CONTROLLED_RUNTIME:
+            if self.consumer_only:
+                await self._verify_consumer_access()
+            elif self.database.migration_profile is MigrationProfile.CONTROLLED_RUNTIME:
                 # Local import avoids the canonical-payload dependency cycle.
                 from .operator_control import OperatorControlRepository
 
                 await OperatorControlRepository(self.database.pool).verify_runtime_access()
             self.repository = AuditRepository(self.database.pool)
             self._started = True
-            self._dispatcher = asyncio.create_task(
-                self._dispatch_outbox(), name=f"{self.service_name}-outbox"
+            if not self.consumer_only:
+                self._dispatcher = asyncio.create_task(
+                    self._dispatch_outbox(), name=f"{self.service_name}-outbox"
+                )
+
+    async def _verify_consumer_access(self) -> None:
+        """Require only the read/audit/inbox access needed by durable consumers."""
+        async with self.database.pool.acquire() as connection:
+            async with connection.transaction(readonly=True):
+                role = await connection.fetchrow(
+                    """SELECT r.rolsuper,r.rolbypassrls,r.rolcreaterole,r.rolcreatedb,
+                       r.rolreplication,
+                       has_schema_privilege(current_user,'public','CREATE') AS schema_create,
+                       has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
+                       has_database_privilege(current_user,current_database(),'CONNECT') AS database_connect,
+                       pg_has_role(current_user,d.datdba,'MEMBER') AS owns_database,
+                       EXISTS(SELECT 1 FROM pg_catalog.pg_class c
+                         JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+                         WHERE n.nspname='public' AND c.relname IN
+                           ('schema_migrations','event_audit','message_inbox','message_outbox')
+                           AND pg_has_role(current_user,c.relowner,'MEMBER')) AS owns_runtime_tables,
+                       has_table_privilege(current_user,'public.schema_migrations','SELECT')
+                         AS schema_history_select,
+                       COALESCE((SELECT bool_and(
+                         has_table_privilege(current_user,c.oid,'SELECT')
+                         AND has_table_privilege(current_user,c.oid,'INSERT'))
+                         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
+                           ON n.oid=c.relnamespace
+                         WHERE n.nspname='public' AND c.relkind IN ('r','p')
+                           AND c.relname='event_audit'),FALSE) AS audit_access,
+                       COALESCE((SELECT bool_and(
+                         has_table_privilege(current_user,c.oid,'SELECT')
+                         AND has_table_privilege(current_user,c.oid,'INSERT')
+                         AND has_table_privilege(current_user,c.oid,'UPDATE'))
+                         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
+                           ON n.oid=c.relnamespace
+                         WHERE n.nspname='public' AND c.relkind IN ('r','p')
+                           AND c.relname='message_inbox'),FALSE) AS inbox_access,
+                       COALESCE((SELECT bool_or(has_table_privilege(current_user,c.oid,
+                         'INSERT,UPDATE,DELETE,TRUNCATE'))
+                         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n
+                           ON n.oid=c.relnamespace
+                         WHERE n.nspname='public' AND c.relname='message_outbox'),FALSE)
+                         AS outbox_write_access
+                       FROM pg_catalog.pg_roles r,pg_catalog.pg_database d
+                       WHERE r.rolname=current_user AND d.datname=current_database()"""
+                )
+        required = (
+            "schema_usage",
+            "database_connect",
+            "schema_history_select",
+            "audit_access",
+            "inbox_access",
+        )
+        elevated = ("rolsuper", "rolbypassrls", "rolcreaterole", "rolcreatedb", "rolreplication")
+        if (
+            role is None
+            or any(role[name] for name in elevated)
+            or role["schema_create"]
+            or role["owns_database"]
+            or role["owns_runtime_tables"]
+            or role["outbox_write_access"]
+            or any(not role[name] for name in required)
+        ):
+            raise PermissionError(
+                "consumer-only database role does not satisfy isolated least-privilege grants"
             )
 
     async def start(self) -> None:
@@ -140,6 +218,8 @@ class DurableMessageBus(MessageBus):
         return self.repository
 
     async def publish(self, topic: str, message: Publishable) -> str:
+        if self.consumer_only:
+            raise RuntimeError("publish is disabled in consumer-only mode")
         await self._ensure_started()
         payload = _publishable_payload(message)
         message_id = _message_id(payload)
@@ -233,7 +313,8 @@ class DurableMessageBus(MessageBus):
                 )
             if should_ack:
                 await self.transport.ack(topic, envelope, group=logical_group)
-                self._wake_dispatcher.set()
+                if not self.consumer_only:
+                    self._wake_dispatcher.set()
 
     async def ack(self, topic: str, envelope: BusEnvelope, *, group: str | None = None) -> None:
         delivery = self._delivery.get()
@@ -359,7 +440,8 @@ class DurableMessageBus(MessageBus):
         if self._closing:
             return
         self._closing = True
-        self._wake_dispatcher.set()
+        if self._dispatcher is not None:
+            self._wake_dispatcher.set()
         if self._dispatcher is not None:
             try:
                 await asyncio.wait_for(self._dispatcher, timeout=self.settings.shutdown_timeout_s)
