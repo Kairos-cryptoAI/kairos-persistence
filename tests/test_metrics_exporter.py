@@ -398,11 +398,18 @@ def test_runtime_epoch_status_rejects_file_swap_between_lstat_and_open(monkeypat
         replacement.write_text(json.dumps(_serve_status()), encoding="utf-8")
         original_open = os.open
 
-        def open_replacement(_path, flags):
-            return original_open(replacement, flags)
+        def open_replacement(file, flags, *args, **kwargs):
+            try:
+                opened_path = Path(file)
+            except TypeError:
+                return original_open(file, flags, *args, **kwargs)
+            if opened_path == path:
+                return original_open(replacement, flags, *args, **kwargs)
+            return original_open(file, flags, *args, **kwargs)
 
-        monkeypatch.setattr(metrics_exporter.os, "open", open_replacement)
-        assert _observe_file(path).state == "invalid"
+        with monkeypatch.context() as scoped_monkeypatch:
+            scoped_monkeypatch.setattr(metrics_exporter.os, "open", open_replacement)
+            assert _observe_file(path).state == "invalid"
 
 
 def test_runtime_epoch_status_rejects_nonregular_and_oversized_files():
