@@ -511,7 +511,8 @@ async def collect_runtime_metrics(
     if runtime_epoch_status_path is None:
         runtime_epoch_serve = None
     else:
-        assert runtime_epoch_expected_owner is not None
+        if runtime_epoch_expected_owner is None:
+            raise ValueError("runtime epoch status path and owner must be configured together")
         runtime_epoch_serve = observe_runtime_epoch_serve_status(
             runtime_epoch_status_path,
             expected_owner=runtime_epoch_expected_owner,
