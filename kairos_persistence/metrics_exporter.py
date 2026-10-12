@@ -4,14 +4,53 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import math
 import os
+import re
+import stat
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .config import PersistenceSettings
 from .database import Database
+
+RUNTIME_EPOCH_STATUS_MAX_BYTES = 32_768
+RUNTIME_EPOCH_STATUS_STALE_SECONDS = 30.0
+RUNTIME_EPOCH_OWNER_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+RUNTIME_EPOCH_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+RUNTIME_EPOCH_STATE_LABELS = (
+    "running",
+    "stale",
+    "failed_closed",
+    "missing",
+    "invalid",
+    "unknown_owner",
+)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while rejecting ambiguous duplicate keys."""
+
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+@dataclass(frozen=True)
+class RuntimeEpochServeObservation:
+    """Sanitized, bounded observation of one explicitly configured serve status file."""
+
+    state: str
+    age_seconds: float
+    stale: bool
 
 
 @dataclass(frozen=True)
@@ -62,9 +101,147 @@ class RuntimeMetrics:
     venue_poll_failed_24h: int = 0
     oldest_inbox_processing_age_seconds: float = -1.0
     inbox_expired_processing: int = 0
+    runtime_epoch_serve: RuntimeEpochServeObservation | None = None
 
 
 RedisProbe = Callable[[str], Awaitable[bool]]
+
+
+def observe_runtime_epoch_serve_status(
+    path: str | Path,
+    *,
+    expected_owner: str,
+    now: datetime | None = None,
+    stale_after_seconds: float = RUNTIME_EPOCH_STATUS_STALE_SECONDS,
+) -> RuntimeEpochServeObservation:
+    """Read one configured status file without exposing its contents or diagnostics.
+
+    The caller binds the path to an epoch. A FAILED_CLOSED record may omit its
+    owner, but a RUNNING_NONTRADING record is accepted only for expected_owner
+    and with the full non-trading readiness contract.
+    """
+
+    if RUNTIME_EPOCH_OWNER_PATTERN.fullmatch(expected_owner) is None:
+        raise ValueError("invalid runtime epoch owner")
+    if not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
+        raise ValueError("runtime epoch freshness interval must be positive")
+    now_utc = now or datetime.now(UTC)
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("runtime epoch observation clock must be timezone-aware")
+    now_utc = now_utc.astimezone(UTC)
+
+    def result(state: str, age_seconds: float = -1.0) -> RuntimeEpochServeObservation:
+        return RuntimeEpochServeObservation(
+            state,
+            age_seconds,
+            age_seconds >= 0 and age_seconds > stale_after_seconds,
+        )
+
+    try:
+        status_path = Path(path)
+        info = status_path.lstat()
+        file_attributes = getattr(info, "st_file_attributes", 0)
+        if (
+            status_path.is_symlink()
+            or file_attributes & 0x400  # Windows FILE_ATTRIBUTE_REPARSE_POINT
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > RUNTIME_EPOCH_STATUS_MAX_BYTES
+        ):
+            return result("invalid")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(status_path, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            opened_info = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(opened_info.st_mode)
+                or opened_info.st_size > RUNTIME_EPOCH_STATUS_MAX_BYTES
+                or (opened_info.st_dev, opened_info.st_ino) != (info.st_dev, info.st_ino)
+                or getattr(opened_info, "st_file_attributes", 0) & 0x400
+            ):
+                return result("invalid")
+            raw = stream.read(RUNTIME_EPOCH_STATUS_MAX_BYTES + 1)
+        if len(raw) > RUNTIME_EPOCH_STATUS_MAX_BYTES:
+            return result("invalid")
+        value = json.loads(raw, object_pairs_hook=_unique_json_object)
+    except FileNotFoundError:
+        return result("missing")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return result("invalid")
+
+    if not isinstance(value, dict):
+        return result("invalid")
+    observed_raw = value.get("observed_at_utc")
+    if not isinstance(observed_raw, str):
+        return result("invalid")
+    try:
+        observed = datetime.fromisoformat(observed_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return result("invalid")
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        return result("invalid")
+    observed = observed.astimezone(UTC)
+    if observed > now_utc:
+        return result("invalid")
+    age_seconds = (now_utc - observed).total_seconds()
+
+    state = value.get("state")
+    owner = value.get("owner")
+    if state == "FAILED_CLOSED":
+        if value.get("mode") != "serve" or value.get("trading_started") is not False:
+            return result("invalid", age_seconds)
+        if owner is not None and owner != expected_owner:
+            return result("unknown_owner", age_seconds)
+        return result("failed_closed", age_seconds)
+
+    if state != "RUNNING_NONTRADING":
+        return result("invalid", age_seconds)
+    if owner != expected_owner:
+        return result("unknown_owner", age_seconds)
+    if value.get("mode", "serve") != "serve":
+        return result("invalid", age_seconds)
+    if (
+        any(value.get(flag) is not False for flag in ("PAPER_QUALIFIED", "ALPHA_READY", "LIVE_READY"))
+        or value.get("STRATEGY_POLICY") != "REJECT_ALL"
+    ):
+        return result("invalid", age_seconds)
+    if "trading_started" in value and value["trading_started"] is not False:
+        return result("invalid", age_seconds)
+
+    counters = (
+        "cycles",
+        "pending_outbox",
+        "unresolved_inbox",
+        "completed_inbox",
+        "uncompleted_publications",
+        "new_publications",
+    )
+    if any(type(value.get(name)) is not int or value[name] < 0 for name in counters):
+        return result("invalid", age_seconds)
+    if value["cycles"] < 1:
+        return result("invalid", age_seconds)
+    if any(value[name] != 0 for name in ("pending_outbox", "unresolved_inbox", "uncompleted_publications")):
+        return result("invalid", age_seconds)
+    watermarks = value.get("watermarks_ms")
+    if (
+        not isinstance(watermarks, dict)
+        or set(watermarks) != set(RUNTIME_EPOCH_SYMBOLS)
+        or any(
+            type(watermarks.get(symbol)) is not int
+            or watermarks[symbol] <= 0
+            or watermarks[symbol] % 60_000 != 0
+            for symbol in RUNTIME_EPOCH_SYMBOLS
+        )
+    ):
+        return result("invalid", age_seconds)
+    watermark_values = [watermarks[symbol] for symbol in RUNTIME_EPOCH_SYMBOLS]
+    if len(set(watermark_values)) != 1 or watermark_values[0] > int(observed.timestamp() * 1000):
+        return result("invalid", age_seconds)
+
+    return result(
+        "stale" if age_seconds > stale_after_seconds else "running",
+        age_seconds,
+    )
+
 
 _QUERY = """
 WITH bounds AS (
@@ -326,7 +503,19 @@ async def collect_runtime_metrics(
     *,
     redis_url: str,
     redis_probe: RedisProbe = probe_redis,
+    runtime_epoch_status_path: str | Path | None = None,
+    runtime_epoch_expected_owner: str | None = None,
 ) -> RuntimeMetrics:
+    if (runtime_epoch_status_path is None) != (runtime_epoch_expected_owner is None):
+        raise ValueError("runtime epoch status path and owner must be configured together")
+    if runtime_epoch_status_path is None:
+        runtime_epoch_serve = None
+    else:
+        assert runtime_epoch_expected_owner is not None
+        runtime_epoch_serve = observe_runtime_epoch_serve_status(
+            runtime_epoch_status_path,
+            expected_owner=runtime_epoch_expected_owner,
+        )
     redis_task = asyncio.ensure_future(redis_probe(redis_url))
     try:
         async with pool.acquire() as connection:
@@ -334,7 +523,18 @@ async def collect_runtime_metrics(
         persistence_up = 1
     except Exception:
         await redis_task
-        return RuntimeMetrics(0, int(redis_task.result()), 0, 0, 0, 0, 0, 0, 0)
+        return RuntimeMetrics(
+            0,
+            int(redis_task.result()),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            runtime_epoch_serve=runtime_epoch_serve,
+        )
     redis_up = int(await redis_task)
     return RuntimeMetrics(
         persistence_up=persistence_up,
@@ -383,6 +583,7 @@ async def collect_runtime_metrics(
         venue_poll_failed_24h=int(row["venue_poll_failed_24h"]),
         oldest_inbox_processing_age_seconds=float(row["oldest_inbox_processing_age_seconds"]),
         inbox_expired_processing=int(row["inbox_expired_processing"]),
+        runtime_epoch_serve=runtime_epoch_serve,
     )
 
 
@@ -401,7 +602,7 @@ def render_prometheus(metrics: RuntimeMetrics) -> bytes:
 
 
 def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int | float], ...]:
-    return (
+    values = (
         ("kairos_persistence_up", "TimescaleDB metrics query succeeded.", "gauge", metrics.persistence_up),
         ("kairos_redis_up", "Authenticated Redis PING succeeded.", "gauge", metrics.redis_up),
         (
@@ -659,9 +860,52 @@ def as_metric_values(metrics: RuntimeMetrics) -> tuple[tuple[str, str, str, int 
             metrics.evedex_venue_rate_limit_reserve,
         ),
     )
+    if metrics.runtime_epoch_serve is None:
+        return values
+    epoch = metrics.runtime_epoch_serve
+    return (
+        values
+        + tuple(
+            (
+                "kairos_runtime_epoch_serve_status_" + state,
+                "One-hot state of the explicitly configured non-trading runtime epoch.",
+                "gauge",
+                int(epoch.state == state),
+            )
+            for state in RUNTIME_EPOCH_STATE_LABELS
+        )
+        + (
+            (
+                "kairos_runtime_epoch_serve_status_age_seconds",
+                "Age of the configured runtime epoch status; -1 means no valid timestamp.",
+                "gauge",
+                epoch.age_seconds,
+            ),
+            (
+                "kairos_runtime_epoch_serve_heartbeat_stale",
+                "Whether the configured runtime epoch heartbeat is older than its freshness limit.",
+                "gauge",
+                int(epoch.stale),
+            ),
+        )
+    )
 
 
-async def run_exporter(*, host: str, port: int, redis_url: str) -> None:
+async def run_exporter(
+    *,
+    host: str,
+    port: int,
+    redis_url: str,
+    runtime_epoch_status_path: str | Path | None = None,
+    runtime_epoch_expected_owner: str | None = None,
+) -> None:
+    if (runtime_epoch_status_path is None) != (runtime_epoch_expected_owner is None):
+        raise ValueError("runtime epoch status path and owner must be configured together")
+    if (
+        runtime_epoch_expected_owner is not None
+        and RUNTIME_EPOCH_OWNER_PATTERN.fullmatch(runtime_epoch_expected_owner) is None
+    ):
+        raise ValueError("invalid runtime epoch owner")
     # Observation must never run schema DDL.  Keep the exporter query-only and
     # fail closed when the database is not at the exact runtime schema profile.
     database = Database(PersistenceSettings(), read_only=True)
@@ -681,7 +925,12 @@ async def run_exporter(*, host: str, port: int, redis_url: str) -> None:
                     status = b"HTTP/1.1 404 Not Found\r\n"
                 else:
                     body = render_prometheus(
-                        await collect_runtime_metrics(database.pool, redis_url=redis_url)
+                        await collect_runtime_metrics(
+                            database.pool,
+                            redis_url=redis_url,
+                            runtime_epoch_status_path=runtime_epoch_status_path,
+                            runtime_epoch_expected_owner=runtime_epoch_expected_owner,
+                        )
                     )
                     status = b"HTTP/1.1 200 OK\r\n"
                 writer.write(
@@ -717,7 +966,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     redis_url = os.getenv("KAIROS_REDIS_URL", "")
     if not redis_url:
         raise ValueError("KAIROS_REDIS_URL is required")
-    asyncio.run(run_exporter(host=args.host, port=args.port, redis_url=redis_url))
+    runtime_epoch_status_path = os.getenv("KAIROS_RUNTIME_EPOCH_STATUS_PATH")
+    runtime_epoch_expected_owner = os.getenv("KAIROS_RUNTIME_EPOCH_STATUS_OWNER")
+    if (runtime_epoch_status_path is None) != (runtime_epoch_expected_owner is None):
+        raise ValueError("runtime epoch status path and owner must be configured together")
+    asyncio.run(
+        run_exporter(
+            host=args.host,
+            port=args.port,
+            redis_url=redis_url,
+            runtime_epoch_status_path=runtime_epoch_status_path,
+            runtime_epoch_expected_owner=runtime_epoch_expected_owner,
+        )
+    )
     return 0
 
 

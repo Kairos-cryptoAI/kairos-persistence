@@ -1,12 +1,52 @@
+import json
+import os
+import tempfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 import pytest
 
+from kairos_persistence import metrics_exporter
 from kairos_persistence.metrics_exporter import (
     _QUERY,
+    RuntimeEpochServeObservation,
     RuntimeMetrics,
     _resp_command,
     collect_runtime_metrics,
+    observe_runtime_epoch_serve_status,
     render_prometheus,
 )
+
+EPOCH_OWNER = "69893dc7b7c647f49967387e7efca9fb"
+OBSERVED_NOW = datetime(2026, 10, 12, 12, 0, tzinfo=UTC)
+COMMON_WATERMARK_MS = 1_791_806_340_000  # 2026-10-12 11:59:00 UTC
+
+
+def _serve_status(**changes):
+    value = {
+        "state": "RUNNING_NONTRADING",
+        "owner": EPOCH_OWNER,
+        "cycles": 3,
+        "watermarks_ms": {
+            symbol: COMMON_WATERMARK_MS for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+        },
+        "pending_outbox": 0,
+        "unresolved_inbox": 0,
+        "completed_inbox": 0,
+        "uncompleted_publications": 0,
+        "new_publications": 0,
+        "observed_at_utc": (OBSERVED_NOW - timedelta(seconds=5)).isoformat(),
+        "PAPER_QUALIFIED": False,
+        "ALPHA_READY": False,
+        "LIVE_READY": False,
+        "STRATEGY_POLICY": "REJECT_ALL",
+    }
+    value.update(changes)
+    return value
+
+
+def _observe_file(path: Path):
+    return observe_runtime_epoch_serve_status(path, expected_owner=EPOCH_OWNER, now=OBSERVED_NOW)
 
 
 class _Acquire:
@@ -195,3 +235,234 @@ def test_operations_query_is_fail_closed_for_polling_and_paper_reconciliation():
 
 def test_resp_command_does_not_embed_protocol_ambiguity():
     assert _resp_command("AUTH", "p@ss") == b"*2\r\n$4\r\nAUTH\r\n$4\r\np@ss\r\n"
+
+
+def test_runtime_epoch_observation_is_disabled_by_default():
+    metrics = RuntimeMetrics(1, 1, 0, 0, 0, 0, 0, 0, 0.0)
+    rendered = render_prometheus(metrics).decode()
+    assert "kairos_runtime_epoch_serve_status_" not in rendered
+    assert "kairos_runtime_epoch_serve_status_age_seconds" not in rendered
+    assert "kairos_runtime_epoch_serve_heartbeat_stale" not in rendered
+
+
+def test_runtime_epoch_status_reports_fresh_and_stale_running_heartbeat():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "status.json"
+        path.write_text(json.dumps(_serve_status()), encoding="utf-8")
+        fresh = _observe_file(path)
+        assert fresh.state == "running"
+        assert fresh.age_seconds == 5
+
+        stale_value = _serve_status(observed_at_utc=(OBSERVED_NOW - timedelta(seconds=31)).isoformat())
+        path.write_text(json.dumps(stale_value), encoding="utf-8")
+        stale = _observe_file(path)
+        assert stale.state == "stale"
+        assert stale.age_seconds == 31
+
+
+def test_runtime_epoch_status_distinguishes_missing_invalid_and_failed_closed():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "status.json"
+        assert _observe_file(path).state == "missing"
+
+        path.write_text("{not-json", encoding="utf-8")
+        assert _observe_file(path).state == "invalid"
+
+        failure = {
+            "state": "FAILED_CLOSED",
+            "mode": "serve",
+            "observed_at_utc": OBSERVED_NOW.isoformat(),
+            "trading_started": False,
+            "error_type": "RecoveryError",
+            "reason": "postgres password=never-export-this",
+        }
+        path.write_text(json.dumps(failure), encoding="utf-8")
+        observed = _observe_file(path)
+        assert observed.state == "failed_closed"
+        assert observed.age_seconds == 0
+
+        rendered = render_prometheus(
+            RuntimeMetrics(1, 1, 0, 0, 0, 0, 0, 0, 0.0, runtime_epoch_serve=observed)
+        ).decode()
+        assert "kairos_runtime_epoch_serve_status_failed_closed 1" in rendered
+        assert "kairos_runtime_epoch_serve_heartbeat_stale 0" in rendered
+        assert "never-export-this" not in rendered
+        assert "postgres password" not in rendered
+
+        failure["observed_at_utc"] = (OBSERVED_NOW - timedelta(seconds=31)).isoformat()
+        path.write_text(json.dumps(failure), encoding="utf-8")
+        aged_failure = _observe_file(path)
+        assert aged_failure.state == "failed_closed"
+        assert aged_failure.stale is True
+        aged_rendered = render_prometheus(
+            RuntimeMetrics(1, 1, 0, 0, 0, 0, 0, 0, 0.0, runtime_epoch_serve=aged_failure)
+        ).decode()
+        assert "kairos_runtime_epoch_serve_status_failed_closed 1" in aged_rendered
+        assert "kairos_runtime_epoch_serve_heartbeat_stale 1" in aged_rendered
+
+
+def test_runtime_epoch_status_rejects_future_naive_and_wrong_owner():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "status.json"
+        for timestamp in (
+            (OBSERVED_NOW + timedelta(seconds=1)).isoformat(),
+            OBSERVED_NOW.replace(tzinfo=None).isoformat(),
+        ):
+            path.write_text(json.dumps(_serve_status(observed_at_utc=timestamp)), encoding="utf-8")
+            assert _observe_file(path).state == "invalid"
+
+        path.write_text(json.dumps(_serve_status(owner="f" * 32)), encoding="utf-8")
+        assert _observe_file(path).state == "unknown_owner"
+
+        path.write_text(json.dumps(_serve_status(owner=None)), encoding="utf-8")
+        unknown = _observe_file(path)
+        assert unknown.state == "unknown_owner"
+        rendered = render_prometheus(
+            RuntimeMetrics(1, 1, 0, 0, 0, 0, 0, 0, 0.0, runtime_epoch_serve=unknown)
+        ).decode()
+        assert "kairos_runtime_epoch_serve_status_unknown_owner 1" in rendered
+        assert "kairos_runtime_epoch_serve_status_running 1" not in rendered
+
+
+def test_runtime_epoch_status_requires_all_five_watermarks_and_nontrading_flags():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "status.json"
+        invalid_cases = (
+            _serve_status(watermarks_ms={"BTCUSDT": 1_800_000_000_000}),
+            _serve_status(LIVE_READY=True),
+            _serve_status(STRATEGY_POLICY="ALLOW"),
+            _serve_status(cycles=True),
+            _serve_status(unresolved_inbox=-1),
+            _serve_status(pending_outbox=1),
+            _serve_status(unresolved_inbox=1),
+            _serve_status(uncompleted_publications=1),
+            _serve_status(
+                watermarks_ms={
+                    **_serve_status()["watermarks_ms"],
+                    "XRPUSDT": COMMON_WATERMARK_MS + 60_000,
+                }
+            ),
+            _serve_status(
+                watermarks_ms={
+                    symbol: int((OBSERVED_NOW + timedelta(minutes=1)).timestamp() * 1000)
+                    for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+                }
+            ),
+        )
+        for value in invalid_cases:
+            path.write_text(json.dumps(value), encoding="utf-8")
+            assert _observe_file(path).state == "invalid"
+
+
+def test_runtime_epoch_status_rejects_duplicate_json_keys():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "status.json"
+        raw = json.dumps(_serve_status())
+        raw = raw.replace('"cycles": 3', '"cycles": 3, "cycles": 3')
+        path.write_text(raw, encoding="utf-8")
+        assert _observe_file(path).state == "invalid"
+
+
+def test_runtime_epoch_state_and_heartbeat_metrics_never_duplicate_names():
+    base = (1, 1, 0, 0, 0, 0, 0, 0, 0.0)
+    for observation in (
+        RuntimeEpochServeObservation("stale", 31.0, True),
+        RuntimeEpochServeObservation("failed_closed", 31.0, True),
+    ):
+        rendered = render_prometheus(RuntimeMetrics(*base, runtime_epoch_serve=observation)).decode()
+        samples = [line.split(maxsplit=1)[0] for line in rendered.splitlines() if not line.startswith("#")]
+        assert len(samples) == len(set(samples))
+        assert "kairos_runtime_epoch_serve_heartbeat_stale 1" in rendered
+    stale = render_prometheus(
+        RuntimeMetrics(
+            *base,
+            runtime_epoch_serve=RuntimeEpochServeObservation("stale", 31.0, True),
+        )
+    ).decode()
+    failed_closed = render_prometheus(
+        RuntimeMetrics(
+            *base,
+            runtime_epoch_serve=RuntimeEpochServeObservation("failed_closed", 31.0, True),
+        )
+    ).decode()
+    assert "kairos_runtime_epoch_serve_status_stale 1" in stale
+    assert "kairos_runtime_epoch_serve_status_stale 0" in failed_closed
+
+
+def test_runtime_epoch_status_rejects_file_swap_between_lstat_and_open(monkeypatch):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        path = root / "status.json"
+        replacement = root / "replacement.json"
+        path.write_text(json.dumps(_serve_status()), encoding="utf-8")
+        replacement.write_text(json.dumps(_serve_status()), encoding="utf-8")
+        original_open = os.open
+
+        def open_replacement(_path, flags):
+            return original_open(replacement, flags)
+
+        monkeypatch.setattr(metrics_exporter.os, "open", open_replacement)
+        assert _observe_file(path).state == "invalid"
+
+
+def test_runtime_epoch_status_rejects_nonregular_and_oversized_files():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        assert (
+            observe_runtime_epoch_serve_status(root, expected_owner=EPOCH_OWNER, now=OBSERVED_NOW).state
+            == "invalid"
+        )
+        path = root / "status.json"
+        path.write_bytes(b" " * (32_768 + 1))
+        assert _observe_file(path).state == "invalid"
+
+
+@pytest.mark.asyncio
+async def test_runtime_epoch_observation_requires_path_and_owner_together():
+    async def redis_probe(_url):
+        return True
+
+    with pytest.raises(ValueError, match="configured together"):
+        await collect_runtime_metrics(
+            _Pool(_Connection(row={})),
+            redis_url="redis://redis:6379/0",
+            redis_probe=redis_probe,
+            runtime_epoch_status_path="/not-read",
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_epoch_status_remains_visible_when_database_query_fails():
+    async def redis_probe(_url):
+        return True
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "status.json"
+        observed_at = datetime.now(UTC) - timedelta(seconds=5)
+        watermark_ms = int(observed_at.timestamp() // 60) * 60_000
+        path.write_text(
+            json.dumps(
+                _serve_status(
+                    observed_at_utc=observed_at.isoformat(),
+                    watermarks_ms={
+                        symbol: watermark_ms
+                        for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+                    },
+                )
+            ),
+            encoding="utf-8",
+        )
+        metrics = await collect_runtime_metrics(
+            _Pool(_Connection(error=RuntimeError("private database diagnostic"))),
+            redis_url="redis://redis:6379/0",
+            redis_probe=redis_probe,
+            runtime_epoch_status_path=path,
+            runtime_epoch_expected_owner=EPOCH_OWNER,
+        )
+
+    assert metrics.persistence_up == 0
+    assert metrics.runtime_epoch_serve is not None
+    assert metrics.runtime_epoch_serve.state == "running"
+    rendered = render_prometheus(metrics).decode()
+    assert "kairos_runtime_epoch_serve_status_running 1" in rendered
+    assert "private database diagnostic" not in rendered
