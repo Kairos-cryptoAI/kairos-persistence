@@ -60,12 +60,14 @@ _SIMULATOR_MIGRATIONS = _RUNTIME_MIGRATIONS[:-1] + (
 _MIGRATION_MANIFESTS: dict[MigrationProfile, tuple[str, ...]] = {
     MigrationProfile.RUNTIME: _RUNTIME_MIGRATIONS,
     MigrationProfile.SIMULATOR: _SIMULATOR_MIGRATIONS,
-    MigrationProfile.CONTROLLED_RUNTIME: _RUNTIME_MIGRATIONS + ("026_operator_control.sql",),
+    MigrationProfile.CONTROLLED_RUNTIME: _RUNTIME_MIGRATIONS
+    + ("026_operator_control.sql", "028_news_processing.sql"),
     MigrationProfile.RESEARCH_CAMPAIGN: _SIMULATOR_MIGRATIONS + ("027_simulator_adaptive_campaign.sql",),
 }
 _KNOWN_MIGRATIONS = frozenset(_SIMULATOR_MIGRATIONS) | {
     "026_operator_control.sql",
     "027_simulator_adaptive_campaign.sql",
+    "028_news_processing.sql",
 }
 _DATABASE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,62}\Z")
 _SIMULATOR_DATABASE_NAME = re.compile(r"kairos_sim(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,52})?\Z")

@@ -104,7 +104,7 @@ def test_optin_exact_additive_manifest_preserves_old_profiles():
     controlled = Database.migration_names(MigrationProfile.CONTROLLED_RUNTIME)
     campaign = Database.migration_names(MigrationProfile.RESEARCH_CAMPAIGN)
     assert len(runtime) == 17 and len(simulator) == 25
-    assert controlled == runtime + ("026_operator_control.sql",)
+    assert controlled == runtime + ("026_operator_control.sql", "028_news_processing.sql")
     assert campaign == simulator + ("027_simulator_adaptive_campaign.sql",)
     assert "026_operator_control.sql" not in campaign
 

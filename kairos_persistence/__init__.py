@@ -18,6 +18,7 @@ from .mutation_budget import (
     ExecutionMutationBudgetRepository,
     ExecutionMutationReservation,
 )
+from .news_processing import NewsProcessingRepository
 from .offline_outbox_drain import (
     OfflineOutboxDrainResult,
     OfflineOutboxDrainState,
@@ -114,6 +115,7 @@ from .trade_lifecycle import (
 from .usage_budget import LLM_BUDGET_SERVICE, CampaignLLMUsageBudget, DurableLLMUsageBudget
 
 __all__ = [
+    "NewsProcessingRepository",
     "CAMPAIGN_PROVIDER_CAPS",
     "QUALIFICATION_CAMPAIGN_ID",
     "CampaignSourceUsage",

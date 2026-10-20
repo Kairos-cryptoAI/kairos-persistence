@@ -65,6 +65,8 @@ jobs:
       KAIROS_SIM_UPGRADE_TEST_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos_sim_test_upgrade_20260928
       KAIROS_COCKPIT_TEST_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos_cockpit_test_20260923
       KAIROS_COCKPIT_TEST_DATABASE_NAME: kairos_cockpit_test_20260923
+      KAIROS_NEWS_TEST_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos_news_test_20261020
+      KAIROS_NEWS_TEST_DISPOSABLE_CONFIRM: CREATE_NEW_DISPOSABLE_NEWS_GATE
       # The service is fresh for every job; this UUID4 names only its disposable campaign DB.
       KAIROS_RESEARCH_CAMPAIGN_TEST_DATABASE_URL: postgresql://kairos:kairos_test@localhost:5432/kairos_sim_test_campaign_813820fd7ef6404b9948a7e2bc9a5c63
     steps:
@@ -94,6 +96,12 @@ jobs:
           --command "CREATE DATABASE kairos_cockpit_test_20260923"
       - name: Migration smoke
         run: uv run --python 3.11 --locked --dev python scripts/migration_smoke.py
+      - name: Create new isolated news processing integration database
+        env:
+          PGPASSWORD: kairos_test
+        run: >-
+          psql --host localhost --username kairos --dbname kairos
+          --set ON_ERROR_STOP=1 --command "CREATE DATABASE kairos_news_test_20261020"
       - name: Create isolated UUID4 campaign integration database
         env:
           PGPASSWORD: kairos_test
