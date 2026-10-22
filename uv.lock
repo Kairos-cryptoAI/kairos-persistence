@@ -584,9 +584,10 @@ wheels = [
 [[package]]
 name = "kairos-core"
 version = "0.3.0"
-source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=d52fd9734a27f76f8e2bdbf053d477b8e04b81c9#d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" }
+source = { git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=ff3af7592cbd47be985d794d8d9903aaa8e5df07#ff3af7592cbd47be985d794d8d9903aaa8e5df07" }
 dependencies = [
     { name = "aiohttp" },
+    { name = "multidict" },
     { name = "orjson" },
     { name = "prometheus-client" },
     { name = "pydantic" },
@@ -623,7 +624,7 @@ dev = [
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.29,<1" },
     { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=d52fd9734a27f76f8e2bdbf053d477b8e04b81c9" },
+    { name = "kairos-core", git = "https://github.com/Kairos-cryptoAI/kairos-core.git?rev=ff3af7592cbd47be985d794d8d9903aaa8e5df07" },
     { name = "pydantic-settings", specifier = ">=2.2,<3" },
     { name = "structlog", specifier = ">=24.1,<27" },
     { name = "uvicorn", specifier = ">=0.30,<1" },
