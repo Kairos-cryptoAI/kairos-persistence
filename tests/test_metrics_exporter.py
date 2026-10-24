@@ -301,6 +301,45 @@ def test_runtime_epoch_status_distinguishes_missing_invalid_and_failed_closed():
         assert "kairos_runtime_epoch_serve_heartbeat_stale 1" in aged_rendered
 
 
+@pytest.mark.parametrize(
+    ("raw_state", "phase", "wait_reason"),
+    [
+        ("CATCHING_UP_NONTRADING", "catching_up", None),
+        ("WAITING_SOURCE_NONTRADING", "waiting_source", "SOURCE_REQUEST_TIMEOUT"),
+    ],
+)
+def test_nonrunning_source_phases_are_explicit_never_running(tmp_path, raw_state, phase, wait_reason):
+    path = tmp_path / "status.json"
+    value = _serve_status(
+        state=raw_state,
+        source_fresh=False,
+        source_wait_reason=wait_reason,
+        watermarks_ms={**_serve_status()["watermarks_ms"], "XRPUSDT": COMMON_WATERMARK_MS - 60_000},
+    )
+    path.write_text(json.dumps(value), encoding="utf-8")
+    observed = _observe_file(path)
+    assert observed.state == phase
+    assert observed.stale is False
+    rendered = render_prometheus(RuntimeMetrics(1, 1, 0, 0, 0, 0, 0, 0, 0.0, runtime_epoch_serve=observed))
+    assert b"kairos_runtime_epoch_serve_status_running 0" in rendered
+    value["source_fresh"] = True
+    path.write_text(json.dumps(value), encoding="utf-8")
+    invalid = _observe_file(path)
+    assert invalid.state == "invalid"
+    assert invalid.reason == "nonrunning_source_contract"
+
+
+def test_runtime_status_reason_is_a_fixed_code_not_source_detail(tmp_path):
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps(_serve_status(pending_outbox=1, reason="private detail")), encoding="utf-8")
+    observed = _observe_file(path)
+    assert observed.state == "invalid"
+    assert observed.reason == "undrained_cycle"
+    assert "private" not in repr(observed)
+    path.write_text(json.dumps(_serve_status(state=[])), encoding="utf-8")
+    assert _observe_file(path).reason == "unsupported_state"
+
+
 def test_runtime_epoch_status_rejects_future_naive_and_wrong_owner():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "status.json"

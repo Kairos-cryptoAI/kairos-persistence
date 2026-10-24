@@ -352,6 +352,13 @@ exact runtime migration history in a read-only transaction. It never runs
 the metrics listener opens. This protection is specific to the observer and does
 not change migration behavior for the runtime services that own schema setup.
 
+The owner-bound epoch-file observer distinguishes healthy `running` from
+non-healthy `catching_up` and `waiting_source` phases without relaxing readiness,
+queue-drain or source-clock checks. Invalid observations expose only fixed
+reason codes, never source diagnostics or payloads. A fresh status file alone
+does not prove that its owning process/container is alive; the host controller
+must independently check the exact owner and resource identities.
+
 Venue availability is derived from strict `kairos.venue.poll.v1` attempt and
 terminal-outcome facts. The denominator is the full 24-hour slot count for the
 latest interval and symbol-set fingerprint; missing polls, failed reads, process

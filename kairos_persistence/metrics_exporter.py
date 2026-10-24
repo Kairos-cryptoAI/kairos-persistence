@@ -25,6 +25,8 @@ RUNTIME_EPOCH_OWNER_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 RUNTIME_EPOCH_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
 RUNTIME_EPOCH_STATE_LABELS = (
     "running",
+    "catching_up",
+    "waiting_source",
     "stale",
     "failed_closed",
     "missing",
@@ -51,6 +53,7 @@ class RuntimeEpochServeObservation:
     state: str
     age_seconds: float
     stale: bool
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,11 +133,14 @@ def observe_runtime_epoch_serve_status(
         raise ValueError("runtime epoch observation clock must be timezone-aware")
     now_utc = now_utc.astimezone(UTC)
 
-    def result(state: str, age_seconds: float = -1.0) -> RuntimeEpochServeObservation:
+    def result(
+        state: str, age_seconds: float = -1.0, reason: str | None = None
+    ) -> RuntimeEpochServeObservation:
         return RuntimeEpochServeObservation(
             state,
             age_seconds,
             age_seconds >= 0 and age_seconds > stale_after_seconds,
+            reason,
         )
 
     try:
@@ -147,7 +153,7 @@ def observe_runtime_epoch_serve_status(
             or not stat.S_ISREG(info.st_mode)
             or info.st_size > RUNTIME_EPOCH_STATUS_MAX_BYTES
         ):
-            return result("invalid")
+            return result("invalid", reason="unsafe_status_file")
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(status_path, flags)
         with os.fdopen(descriptor, "rb") as stream:
@@ -158,54 +164,63 @@ def observe_runtime_epoch_serve_status(
                 or (opened_info.st_dev, opened_info.st_ino) != (info.st_dev, info.st_ino)
                 or getattr(opened_info, "st_file_attributes", 0) & 0x400
             ):
-                return result("invalid")
+                return result("invalid", reason="status_file_identity_changed")
             raw = stream.read(RUNTIME_EPOCH_STATUS_MAX_BYTES + 1)
         if len(raw) > RUNTIME_EPOCH_STATUS_MAX_BYTES:
-            return result("invalid")
+            return result("invalid", reason="status_too_large")
         value = json.loads(raw, object_pairs_hook=_unique_json_object)
     except FileNotFoundError:
         return result("missing")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-        return result("invalid")
+        return result("invalid", reason="unreadable_or_invalid_json")
 
     if not isinstance(value, dict):
-        return result("invalid")
+        return result("invalid", reason="payload_not_object")
     observed_raw = value.get("observed_at_utc")
     if not isinstance(observed_raw, str):
-        return result("invalid")
+        return result("invalid", reason="invalid_timestamp")
     try:
         observed = datetime.fromisoformat(observed_raw.replace("Z", "+00:00"))
     except ValueError:
-        return result("invalid")
+        return result("invalid", reason="invalid_timestamp")
     if observed.tzinfo is None or observed.utcoffset() is None:
-        return result("invalid")
+        return result("invalid", reason="invalid_timestamp")
     observed = observed.astimezone(UTC)
     if observed > now_utc:
-        return result("invalid")
+        return result("invalid", reason="future_timestamp")
     age_seconds = (now_utc - observed).total_seconds()
 
     state = value.get("state")
     owner = value.get("owner")
     if state == "FAILED_CLOSED":
         if value.get("mode") != "serve" or value.get("trading_started") is not False:
-            return result("invalid", age_seconds)
+            return result("invalid", age_seconds, "failed_closed_contract")
         if owner is not None and owner != expected_owner:
             return result("unknown_owner", age_seconds)
         return result("failed_closed", age_seconds)
 
-    if state != "RUNNING_NONTRADING":
-        return result("invalid", age_seconds)
+    phase = (
+        {
+            "RUNNING_NONTRADING": "running",
+            "CATCHING_UP_NONTRADING": "catching_up",
+            "WAITING_SOURCE_NONTRADING": "waiting_source",
+        }.get(state)
+        if isinstance(state, str)
+        else None
+    )
+    if phase is None:
+        return result("invalid", age_seconds, "unsupported_state")
     if owner != expected_owner:
         return result("unknown_owner", age_seconds)
     if value.get("mode", "serve") != "serve":
-        return result("invalid", age_seconds)
+        return result("invalid", age_seconds, "invalid_mode")
     if (
         any(value.get(flag) is not False for flag in ("PAPER_QUALIFIED", "ALPHA_READY", "LIVE_READY"))
         or value.get("STRATEGY_POLICY") != "REJECT_ALL"
     ):
-        return result("invalid", age_seconds)
+        return result("invalid", age_seconds, "readiness_contract")
     if "trading_started" in value and value["trading_started"] is not False:
-        return result("invalid", age_seconds)
+        return result("invalid", age_seconds, "trading_started")
 
     counters = (
         "cycles",
@@ -216,11 +231,11 @@ def observe_runtime_epoch_serve_status(
         "new_publications",
     )
     if any(type(value.get(name)) is not int or value[name] < 0 for name in counters):
-        return result("invalid", age_seconds)
+        return result("invalid", age_seconds, "invalid_counters")
     if value["cycles"] < 1:
-        return result("invalid", age_seconds)
+        return result("invalid", age_seconds, "no_completed_cycle")
     if any(value[name] != 0 for name in ("pending_outbox", "unresolved_inbox", "uncompleted_publications")):
-        return result("invalid", age_seconds)
+        return result("invalid", age_seconds, "undrained_cycle")
     watermarks = value.get("watermarks_ms")
     if (
         not isinstance(watermarks, dict)
@@ -232,13 +247,29 @@ def observe_runtime_epoch_serve_status(
             for symbol in RUNTIME_EPOCH_SYMBOLS
         )
     ):
-        return result("invalid", age_seconds)
+        return result("invalid", age_seconds, "invalid_watermarks")
     watermark_values = [watermarks[symbol] for symbol in RUNTIME_EPOCH_SYMBOLS]
-    if len(set(watermark_values)) != 1 or watermark_values[0] > int(observed.timestamp() * 1000):
-        return result("invalid", age_seconds)
+    if max(watermark_values) > int(observed.timestamp() * 1000):
+        return result("invalid", age_seconds, "future_watermark")
+    if phase == "running" and (
+        len(set(watermark_values)) != 1 or value.get("source_fresh", True) is not True
+    ):
+        return result("invalid", age_seconds, "running_source_contract")
+    if phase != "running" and (
+        value.get("source_fresh") is not False
+        or (
+            phase == "waiting_source"
+            and (
+                not isinstance(value.get("source_wait_reason"), str)
+                or not 1 <= len(value["source_wait_reason"]) <= 160
+            )
+        )
+        or (phase == "catching_up" and value.get("source_wait_reason") is not None)
+    ):
+        return result("invalid", age_seconds, "nonrunning_source_contract")
 
     return result(
-        "stale" if age_seconds > stale_after_seconds else "running",
+        "stale" if age_seconds > stale_after_seconds else phase,
         age_seconds,
     )
 
